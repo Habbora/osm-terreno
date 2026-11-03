@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OrthoForge · Patch Editor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="editor.css">
+</head>
+<body>
+<header id="top">
+  <div class="top-row file">
+    <div class="brand" title="OrthoForge Patch Editor">
+      <span class="logo">OF</span>
+      <div>
+        <strong>Patch Editor</strong>
+        <span id="fileLabel" class="muted">—</span>
+        <span id="savePath" class="muted path" title="Ctrl+S grava neste arquivo">—</span>
+      </div>
+    </div>
+    <div class="grp">
+      <select id="fileSel" title="Patches do OrthoForge (Ctrl+S grava o arquivo aberto)"></select>
+      <button id="btnSave" class="primary" title="Salvar no mesmo arquivo (Ctrl+S)">Salvar</button>
+      <button id="btnDl" title="Baixar XML">Baixar</button>
+      <button id="btnUndo" title="Desfazer (Ctrl+Z)">↺</button>
+      <button id="btnRedo" title="Refazer (Ctrl+Y)">↻</button>
+      <button id="btnLive" title="Recarregar o arquivo a cada 2 s">Ao vivo</button>
+      <button id="btnOpen" title="Abrir um .osm do disco e passar a gravar nele">Abrir…</button>
+      <input id="file" type="file" accept=".osm,.xml" hidden>
+    </div>
+    <i class="sep"></i>
+    <div class="grp">
+      <button id="btnSat" class="active" title="Satélite Esri">Sat</button>
+      <button id="btnOsm" title="Mapa OSM">OSM</button>
+      <button id="btnTopo" title="Relevo">Topo</button>
+      <button id="btnFit" title="Enquadrar tudo">⊡</button>
+      <button id="btnZoomSel" title="Enquadrar seleção (Z)">⊞</button>
+      <button id="btnTile" title="Limite do tile 1°">Tile</button>
+      <button id="btnRef" title="Pistas e água do OSM (referência)">OSM ref</button>
+      <button id="btnLabels" class="active" title="Rótulos no mapa">Abc</button>
+      <label class="op" title="Opacidade dos polígonos">Op <input id="op" type="range" min="10" max="80" value="40"></label>
+    </div>
+    <span class="grow"></span>
+    <button id="btnHelp" title="Atalhos (?)">?</button>
+  </div>
+
+  <div class="top-row cmds">
+    <div class="grp lab" data-lab="Área">
+      <button class="ico active" data-sel="area" title="Selecionar área (1)">Área</button>
+      <button class="ico" id="btnMerge" title="Fundir duas áreas que compartilham 2 nós numa só (W)">Unir</button>
+      <button class="ico" id="btnRing" title="Fechar ou abrir anel (O)">Anel</button>
+    </div>
+    <i class="sep"></i>
+    <div class="grp lab" data-lab="Aresta">
+      <button class="ico" data-sel="edge" title="Selecionar aresta (2)">Aresta</button>
+      <button class="ico" data-mode="join" title="Criar rampa entre arestas de duas áreas (J)">Juntar</button>
+      <button class="ico" data-mode="insert" title="Inserir vértice na aresta (I)">+Vért</button>
+    </div>
+    <i class="sep"></i>
+    <div class="grp lab" data-lab="Nós">
+      <button class="ico" data-sel="node" title="Selecionar e mover nós (3)">Nós</button>
+      <button class="ico" data-mode="split" title="Dividir anel em 2 nós (X)">Dividir</button>
+      <button class="ico" data-mode="measure" title="Medir (M)">Medir</button>
+      <button class="ico" data-mode="elev" title="Amostrar DEM (H)">DEM</button>
+    </div>
+    <i class="sep"></i>
+    <div class="grp lab" data-lab="Desenhar">
+      <button class="ico" data-mode="draw" data-kind="flat" title="Desenhar flatten (F)">Flatten</button>
+      <button class="ico" data-mode="draw" data-kind="ramp" title="Desenhar rampa (P)">Rampa</button>
+      <button class="ico" data-mode="draw" data-kind="water" title="Desenhar água (A)">Água</button>
+      <button class="ico" data-mode="draw" data-kind="waterway" title="Curso d'água (C)">Curso</button>
+      <button class="ico" data-mode="draw" data-kind="dummy" title="Dummy / restrição de malha (U)">Dummy</button>
+      <button class="ico" data-mode="draw" data-kind="rel" title="cst_alt_rel">Rel</button>
+      <button class="ico" data-mode="draw" data-kind="shift" title="var_alt_rel">Shift</button>
+      <button class="ico" data-mode="rect" title="Retângulo 3 cliques (R)">Rect</button>
+    </div>
+  </div>
+</header>
+
+<aside id="tools">
+  <div id="projeto">
+    <h2>Terreno</h2>
+    <div class="row wrap">
+      <input id="pastaTerreno" type="text" spellcheck="false">
+      <button id="btnPasta" type="button">Pasta</button>
+    </div>
+    <div id="osmChecks"></div>
+    <div class="row wrap">
+      <button id="btnMarcar" type="button">Selecionar tudo</button>
+      <button id="btnDesmarcar" type="button">Desmarcar tudo</button>
+      <button id="btnImportar" type="button">Importar</button>
+      <button id="btnExportar" type="button">Exportar</button>
+      <button id="btnApagarOsm" type="button">Apagar</button>
+      <button id="btnCompilar" type="button" class="primary">Compilar</button>
+      <button id="btnRecuperar" type="button">Recuperar</button>
+    </div>
+    <input id="fileImport" type="file" accept=".osm,.xml" multiple hidden>
+    <pre id="logTerreno"></pre>
+  </div>
+  <p class="hint" id="toolHint">Modo área. Shift+clique na segunda área e <kbd>W</kbd> une numa só. <kbd>J</kbd> cria rampa.</p>
+  <label class="check"><input id="chkSnap" type="checkbox" checked> Snap em nós <kbd>G</kbd></label>
+  <label class="check"><input id="chkLabels" type="checkbox" checked> Rótulos no mapa</label>
+
+  <h2>Camadas</h2>
+  <label class="check"><input type="checkbox" data-vis="flat" checked> Flatten</label>
+  <label class="check"><input type="checkbox" data-vis="ramp" checked> Rampas</label>
+  <label class="check"><input type="checkbox" data-vis="water" checked> Água</label>
+  <label class="check"><input type="checkbox" data-vis="waterway" checked> Cursos</label>
+  <label class="check"><input type="checkbox" data-vis="dummy" checked> Dummy</label>
+  <label class="check"><input type="checkbox" data-vis="rel" checked> Relativo</label>
+  <label class="check"><input type="checkbox" data-vis="shift" checked> Shift</label>
+  <label class="check"><input type="checkbox" data-vis="other" checked> Outros</label>
+
+  <h2>Objetos <span id="objCount" class="muted"></span></h2>
+  <input id="search" type="search" placeholder="Filtrar way, id, tag…">
+  <div id="legend"></div>
+
+  <h2>Diagnóstico</h2>
+  <div id="cliffs"></div>
+</aside>
+
+<div id="map"></div>
+
+<aside id="insp">
+  <h2>Inspetor</h2>
+  <div id="inspEmpty" class="empty">
+    <p>Nada selecionado.</p>
+    <p class="hint">Área / Aresta / Nós na barra. Modo aresta: clique a borda e arraste. Duas áreas com 2 nós comuns: <kbd>W</kbd> Unir. <kbd>J</kbd> só cria rampa.</p>
+  </div>
+
+  <div id="inspJoin" hidden>
+    <h3>Juntar arestas (rampa)</h3>
+    <p class="hint">Cria uma <b>rampa ou ligação nova</b> entre duas áreas. Para fundir duas áreas numa só, use <b>Unir</b> (<kbd>W</kbd>).</p>
+    <div class="field"><label>Criar</label>
+      <select id="joinKind">
+        <option value="ramp">Rampa</option>
+        <option value="flat">Flatten</option>
+        <option value="dummy">Dummy (malha)</option>
+        <option value="water">Água</option>
+        <option value="waterway">Curso (linha)</option>
+      </select>
+    </div>
+    <div id="joinSlots"></div>
+    <div class="row wrap">
+      <button id="btnJoinGo" class="primary">Criar ligação</button>
+      <button id="btnJoinClear">Limpar</button>
+    </div>
+    <p class="hint">Enter cria · Backspace desfaz o último clique · Esc sai. Vermelho = high, azul = low.</p>
+  </div>
+
+  <div id="inspSplit" hidden>
+    <h3>Dividir</h3>
+    <p class="hint">No <b>anel</b>, clique <b>2 nós</b> (não vizinhos) — o corte é a corda entre eles e viram duas áreas. Na <b>linha</b>, clique 1 nó interior.</p>
+    <div id="splitSlots"></div>
+    <div class="row wrap">
+      <button id="btnSplitGo" class="primary">Dividir agora</button>
+      <button id="btnSplitClear">Limpar</button>
+    </div>
+    <p class="hint">Enter confirma · Backspace desfaz · Esc sai. Os dois nós continuam compartilhados.</p>
+  </div>
+
+  <div id="inspWay" hidden>
+    <div class="field"><span>Way</span><code id="edId"></code></div>
+    <div id="wayStats" class="stats"></div>
+    <div id="mergeBanner" class="join-slot" hidden></div>
+    <div class="field"><label>Tipo</label>
+      <select id="edKind">
+        <option value="flat">Flatten (altitude)</option>
+        <option value="abs">Flatten (cst_alt_abs)</option>
+        <option value="rel">Relativo (cst_alt_rel)</option>
+        <option value="shift">Shift (var_alt_rel)</option>
+        <option value="ramp">Rampa</option>
+        <option value="water">Água (lago / banco)</option>
+        <option value="waterway">Curso d'água</option>
+        <option value="dummy">Dummy (só malha)</option>
+        <option value="other">Outro / tags livres</option>
+      </select>
+    </div>
+    <div class="field show-flat show-abs"><label>Altitude m</label><input id="edAlt" type="text" inputmode="decimal" autocomplete="off"></div>
+    <div class="field show-rel"><label>Offset m</label><input id="edRel" type="number" step="0.1" value="0"></div>
+    <div class="field show-shift"><label>Shift m</label><input id="edShift" type="number" step="0.1" value="0"></div>
+    <div class="field show-ramp"><label>Alt. high</label><input id="edHi" type="text" inputmode="decimal" autocomplete="off"></div>
+    <div class="field show-ramp"><label>Alt. low</label><input id="edLo" type="text" inputmode="decimal" autocomplete="off"></div>
+    <div class="field show-flat show-abs show-ramp"><label>cell_size</label><input id="edCell" type="number" step="0.1" value="2"></div>
+    <div class="field show-ramp"><label>profile</label>
+      <select id="edProf">
+        <option value="spline">spline</option>
+        <option value="plane">plane</option>
+        <option value="tanh">tanh</option>
+        <option value="atanh">atanh</option>
+      </select>
+    </div>
+    <div class="field show-ramp"><label>steepness</label><input id="edSteep" type="number" step="0.1" value="2"></div>
+    <div class="field show-waterway"><label>waterway</label>
+      <select id="edWw">
+        <option value="drain">drain</option>
+        <option value="ditch">ditch</option>
+        <option value="stream">stream</option>
+        <option value="canal">canal</option>
+        <option value="river">river</option>
+      </select>
+    </div>
+    <div class="field show-waterway"><label>width m</label><input id="edWidth" type="number" step="0.1" placeholder="auto"></div>
+    <p class="hint show-ramp">Rampa: <b>4 cantos</b>. Aresta 2 = low (azul), aresta 4 = high (vermelho). Girar nós troca as arestas.</p>
+    <p class="hint show-water">Água não aceita tags de altitude. Modele o terreno com flatten/rampa ao lado.</p>
+    <p class="hint show-dummy">Way sem tags: o mesh segue a linha, sem mudar altitude.</p>
+
+    <div class="actions">
+      <button id="btnApply" class="primary">Aplicar tags</button>
+      <button id="btnElevFill" title="Open-Meteo DEM no centróide">DEM centro</button>
+      <button id="btnAbs" class="show-flat" title="Trocar altitude por cst_alt_abs">→ cst_alt_abs</button>
+    </div>
+
+    <div class="act-group">
+      <span>Área</span>
+      <div class="actions">
+        <button id="btnMergeInsp" class="primary" title="Fundir com a segunda área (W)">Unir áreas</button>
+        <button id="btnClose" title="Fechar ou abrir o anel (O)">Fechar anel</button>
+      </div>
+    </div>
+    <div class="act-group">
+      <span>Nós / aresta</span>
+      <div class="actions">
+        <button id="btnSplit" title="Dividir: 2 nós no anel, 1 na linha (X)">Dividir…</button>
+      </div>
+    </div>
+    <div class="act-group">
+      <span>Geometria</span>
+      <div class="actions">
+        <button id="btnRev">Inverter</button>
+        <button id="btnRot">Girar nós</button>
+        <button id="btnDup" title="Ctrl+D">Duplicar</button>
+        <button id="btnOrtho">Ortogonalizar</button>
+        <button id="btnAlignH">Alinhar H</button>
+        <button id="btnAlignV">Alinhar V</button>
+        <button id="btnDens">Densificar</button>
+        <button id="btnSimp">Simplificar</button>
+        <button id="btnBridge" title="Shift+clique na segunda flatten">Rampa entre</button>
+        <button id="btnDel" class="danger" title="Del">Remover</button>
+      </div>
+    </div>
+    <div class="field"><label>Densificar m</label><input id="edDens" type="number" step="0.5" value="8"></div>
+
+    <h3>Tags</h3>
+    <div class="row wrap" style="margin-bottom:6px">
+      <button id="btnCopyTags">Copiar tags</button>
+      <button id="btnPasteTags">Colar tags</button>
+    </div>
+    <table id="tagTable"><tbody></tbody></table>
+    <div class="row">
+      <input id="newK" placeholder="chave">
+      <input id="newV" placeholder="valor">
+      <button id="btnAddTag">+</button>
+    </div>
+  </div>
+
+  <div id="inspNode" hidden>
+    <h3>Nó</h3>
+    <div class="field"><span>id</span><code id="ndId"></code></div>
+    <div class="field"><label>lat</label><input id="ndLat" type="number" step="0.0000001"></div>
+    <div class="field"><label>lon</label><input id="ndLon" type="number" step="0.0000001"></div>
+    <div class="field"><label>alt_abs</label><input id="ndAbs" type="number" step="0.1" placeholder="—"></div>
+    <div class="field"><label>alt_rel</label><input id="ndRel" type="number" step="0.1" placeholder="—"></div>
+    <p class="hint" id="ndUse"></p>
+    <div class="row wrap">
+      <button id="btnNdApply" class="primary">Aplicar nó</button>
+      <button id="btnNdDel" class="danger">Apagar vértice</button>
+    </div>
+  </div>
+</aside>
+
+<footer id="status">
+  <span id="coords">lat, lon</span>
+  <span id="modeLabel">selecionar</span>
+  <span id="snapLabel">snap</span>
+  <span id="zoomLabel">z14</span>
+  <span id="statLine">Carregando…</span>
+</footer>
+
+<div id="toast"></div>
+
+<dialog id="help">
+  <h2>Atalhos · Patch Editor</h2>
+  <div class="help-grid">
+    <div>
+      <h3>Ferramentas</h3>
+      <ul>
+        <li><kbd>2</kbd> aresta: clique e arraste a borda (os dois nós andam juntos)</li>
+        <li><kbd>W</kbd> unir duas áreas numa só</li>
+        <li><kbd>J</kbd> juntar arestas (cria rampa)</li>
+        <li><kbd>O</kbd> fechar / abrir anel</li>
+        <li><kbd>X</kbd> dividir (2 nós no anel)</li>
+        <li><kbd>I</kbd> inserir vértice</li>
+        <li><kbd>F</kbd> flatten · <kbd>P</kbd> rampa</li>
+        <li><kbd>A</kbd> água · <kbd>C</kbd> curso · <kbd>U</kbd> dummy</li>
+        <li><kbd>R</kbd> retângulo 3 cliques</li>
+        <li><kbd>M</kbd> medir · <kbd>H</kbd> amostrar DEM</li>
+        <li><kbd>G</kbd> snap · <kbd>Z</kbd> enquadrar seleção</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Edição</h3>
+      <ul>
+        <li><kbd>Enter</kbd> fecha desenho / une áreas / cria junção / divide</li>
+        <li><kbd>Esc</kbd> cancela</li>
+        <li><kbd>Del</kbd> remove way ou vértice</li>
+        <li><kbd>Ctrl+S</kbd> salvar no arquivo aberto · <kbd>Ctrl+Z</kbd> / <kbd>Y</kbd> desfazer</li>
+        <li><kbd>Ctrl+D</kbd> duplicar · <kbd>Ctrl+Enter</kbd> aplicar tags</li>
+        <li>Setas: 1 m · <kbd>Shift</kbd>+setas: 0,1 m</li>
+        <li>Botão do meio (ou direito): arrastar o mapa</li>
+        <li><kbd>Espaço</kbd>+arrastar: pan por cima das áreas</li>
+      </ul>
+    </div>
+  </div>
+  <p><b>Anel:</b> fecha a linha no primeiro nó, ou abre um polígono. Enquanto desenha, <kbd>O</kbd> fecha o rascunho.</p>
+  <p><b>Unir:</b> duas áreas que compartilham 2 nós (aresta comum) viram um único anel. A costura some. Não cria rampa.</p>
+  <p><b>Dividir:</b> no anel, 2 nós não vizinhos viram duas áreas (nós compartilhados). Na linha, 1 nó interior corta em duas ways.</p>
+  <p><b>Juntar:</b> 2 vértices (ou a aresta) em cada flatten → rampa colada. Shift+clique escolhe a segunda way para <b>Rampa entre</b> ou <b>Unir</b>.</p>
+  <p>O arquivo precisa terminar em <code>.patch.osm</code> para o Step 1 do OrthoForge ler. <b>Salvar</b> grava no mesmo caminho da pasta <code>Patches</code> (não na pasta do editor).</p>
+  <button id="btnHelpClose" class="primary">Fechar</button>
+</dialog>
+
+<script src="editor.js"></script>
+<script src="painel.js"></script>
+</body>
+</html>
