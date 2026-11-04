@@ -50,7 +50,7 @@ Na primeira vez, use **Pasta...** e aponte para o cenário. No Map Enhancement �
 
 ![Editor do OSM, com os polígonos de SBSP por cima da foto](docs/editor.png)
 
-4. **Ver malha** mostra os triângulos do DSF na área do OSM, sem gravar nada. A linha vermelha é o polígono plano. A laranja é uma rampa. Verde é mais baixo, amarelo e laranja são mais altos. Dá para ver o compilado, o original (`.antes_osm`) e duas prévias. A roda aproxima, arrastar move, e o botão direito copia a coordenada.
+4. **Ver malha** mostra os triângulos do DSF na área do OSM, sem gravar nada. A segunda vez abre do cache, sem ler o DSF de novo. **Atual** é o arquivo do cenário, **Original** é o backup e **Gerar prévia** corta com a faixa e as opções que estão marcadas na janela, sem gravar o DSF. A linha vermelha é o polígono plano. A laranja é uma rampa. Verde é mais baixo, amarelo e laranja são mais altos. A roda aproxima, arrastar move, e o botão direito copia a coordenada.
 
 ![Triângulos do DSF e o contorno do OSM](docs/malha.png)
 5. Ajuste a **Faixa ao redor**, em metros. **Otimizar malha** junta os triângulos planos. **Melhorar triângulos** reduz ângulos muito fechados. As duas são opcionais.

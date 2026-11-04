@@ -41,6 +41,7 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 cancelar = threading.Event()
 _proc_trava = threading.Lock()
 _proc_atual = None
+_proc_compile = None
 _evento_processos = None
 _checagens = 0
 _triangle_trava = threading.Lock()
@@ -58,14 +59,29 @@ def verificar_cancelamento():
         raise Cancelado()
 
 
+def matar_arvore(pid):
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+    else:
+        os.kill(pid, 15)
+
+
 def pedir_cancelamento():
     cancelar.set()
     if _evento_processos is not None:
         _evento_processos.set()
     with _proc_trava:
         proc = _proc_atual
+        compile_proc = _proc_compile
     if proc is not None and proc.poll() is None:
         proc.kill()
+    if compile_proc is not None and compile_proc.poll() is None:
+        matar_arvore(compile_proc.pid)
 
 
 def run_quiet(args, cwd=None):
@@ -397,6 +413,83 @@ def clip_polygons(layers, region):
     return clips
 
 
+class CortadorSeguro:
+    """Corta cada triângulo num processo à parte. Se a melhoria de ângulo cair, o contorno ainda é cortado."""
+
+    def __init__(self, clips, region, quality):
+        self.clips = clips
+        self.region = region
+        self.quality = bool(quality)
+        self.proc = None
+        self.pulou = False
+        self.recuados = 0
+        self.feitos = 0
+        self._abrir(self.quality)
+
+    def _abrir(self, quality):
+        self.proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--cortar"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=NO_WINDOW if os.name == "nt" else 0,
+        )
+        cabeca = json.dumps({
+            "clips": [polygon.wkt for polygon in self.clips],
+            "region": self.region.wkt,
+            "quality": bool(quality),
+        })
+        self.proc.stdin.write((cabeca + "\n").encode("utf-8"))
+        self.proc.stdin.flush()
+
+    def _uma(self, verts):
+        if self.proc is None or self.proc.poll() is not None:
+            return None
+        try:
+            self.proc.stdin.write((json.dumps(verts) + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+            linha = self.proc.stdout.readline()
+        except OSError:
+            return None
+        if not linha:
+            self.fechar()
+            return None
+        data = json.loads(linha.decode("utf-8"))
+        if isinstance(data, dict):
+            return None
+        return [tuple(ponto) for ponto in data]
+
+    def cortar(self, verts):
+        self.pulou = False
+        if self.proc is None or self.proc.poll() is not None:
+            self._abrir(self.quality)
+        data = self._uma(verts)
+        if data is None and self.quality:
+            self.fechar()
+            self._abrir(False)
+            data = self._uma(verts)
+            self.fechar()
+            self._abrir(self.quality)
+            if data is not None:
+                self.recuados += 1
+        if data is None:
+            self.pulou = True
+            if self.proc is None or self.proc.poll() is not None:
+                self._abrir(self.quality)
+            return [tuple(tuple(p) for p in verts)]
+        self.feitos += 1
+        if self.quality and self.feitos % 1500 == 0:
+            self.fechar()
+            self._abrir(self.quality)
+        return data
+
+    def fechar(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        self.proc = None
+
+
 def cut_triangle(verts, clips, region, quality=False):
     """Divide um triângulo nas bordas do OSM. Cada vértice é (lon, lat, extras)."""
     corners = [(v[0], v[1]) for v in verts]
@@ -469,15 +562,37 @@ def edge_key(a, b):
     return (ka, kb) if ka <= kb else (kb, ka)
 
 
+class Lote(list):
+    def __init__(self, tipo):
+        super().__init__()
+        self.tipo = tipo
+
+
+def triangulos_do_lote(batch):
+    """O DSF gravado guarda tiras. Ler de 3 em 3 abre buraco no meio da tira."""
+    tipo = getattr(batch, "tipo", 0)
+    if tipo == 1:
+        saida = []
+        for indice in range(len(batch) - 2):
+            a, b, c = batch[indice], batch[indice + 1], batch[indice + 2]
+            saida.append((a, c, b) if indice % 2 else (a, b, c))
+        return saida
+    if tipo == 2 and batch:
+        return [(batch[0], batch[indice], batch[indice + 1]) for indice in range(1, len(batch) - 1)]
+    return [tuple(batch[indice : indice + 3]) for indice in range(0, len(batch) - 2, 3)]
+
+
 def read_batches(src):
     """Gera (linha, lote) para cada linha do texto do DSF. O lote vem no END_PRIMITIVE."""
     primitive = False
-    batch = []
+    batch = Lote(0)
     with open(src, "r", encoding="utf-8", errors="ignore") as fin:
         for line in fin:
             if line.startswith("BEGIN_PRIMITIVE"):
                 primitive = True
-                batch = []
+                partes = line.split()
+                tipo = int(partes[1]) if len(partes) > 1 else 0
+                batch = Lote(tipo)
                 yield line, None
                 continue
             if line.startswith("END_PRIMITIVE"):
@@ -525,6 +640,8 @@ def cdt_parts(shape):
 
 def quality_parts(face):
     """Triangle (Shewchuk) sem ponto novo na borda e sem limite de tamanho. Só cria ponto no meio para evitar ângulo fechado."""
+    if face.is_empty or not face.is_valid or face.area <= 1e-16:
+        return None
     ox, oy = face.bounds[0], face.bounds[1]
     m_lon = 111320.0 * cos(radians(oy))
     vertices = []
@@ -548,6 +665,13 @@ def quality_parts(face):
         if index > 0:
             inside = Polygon(ring).representative_point()
             holes.append(((inside.x - ox) * m_lon, (inside.y - oy) * 111320.0))
+    for i, (x, y) in enumerate(vertices):
+        for j in range(i):
+            if hypot(x - vertices[j][0], y - vertices[j][1]) < 1e-3:
+                return None
+    for a, b in segments:
+        if hypot(vertices[a][0] - vertices[b][0], vertices[a][1] - vertices[b][1]) < 1e-3:
+            return None
     data = {"vertices": vertices, "segments": segments}
     if holes:
         data["holes"] = holes
@@ -713,9 +837,8 @@ def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, 
     for _line, batch in read_batches(src):
         if batch is None:
             continue
-        for index in range(0, len(batch) - 2, 3):
+        for verts in triangulos_do_lote(batch):
             verificar_cancelamento()
-            verts = batch[index : index + 3]
             choice = decide(verts)
             if choice is None:
                 continue
@@ -746,6 +869,8 @@ def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, 
     log("cortando os triangulos")
     kept = 0
     cut = 0
+    pulados = 0
+    cortador = CortadorSeguro(clips, region, melhorar)
     turn = 0
     before = 0
     after = 0
@@ -754,64 +879,72 @@ def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, 
 
     def write_block(begin, pieces):
         for start in range(0, len(pieces), 2000):
-            fout.write(begin)
+            fout.write("BEGIN_PRIMITIVE 0\n")
             for piece in pieces[start : start + 2000]:
                 for vertex in piece:
                     fout.write(format_vertex(vertex, vertex[2]))
             fout.write("END_PRIMITIVE\n")
 
-    with open(dst, "w", encoding="utf-8", newline="\n") as fout:
-        for line, batch in read_batches(src):
-            if batch is None:
-                if line.startswith("BEGIN_PRIMITIVE"):
-                    pending_begin = line
+    try:
+        with open(dst, "w", encoding="utf-8", newline="\n") as fout:
+            for line, batch in read_batches(src):
+                if batch is None:
+                    if line.startswith("BEGIN_PRIMITIVE"):
+                        pending_begin = line
+                        continue
+                    if line.startswith("END_PATCH") and patch_cut:
+                        before += len(patch_cut)
+                        merged = merge_flat(patch_cut)
+                        after += len(merged)
+                        write_block(patch_begin, merged)
+                        patch_cut = []
+                    fout.write(line)
                     continue
-                if line.startswith("END_PATCH") and patch_cut:
-                    before += len(patch_cut)
-                    merged = merge_flat(patch_cut)
-                    after += len(merged)
-                    write_block(patch_begin, merged)
-                    patch_cut = []
-                fout.write(line)
-                continue
-            begin = pending_begin or "BEGIN_PRIMITIVE 0\n"
-            direct = []
-            made = []
-            for index in range(0, len(batch) - 2, 3):
-                verificar_cancelamento()
-                verts = batch[index : index + 3]
-                lons = [v[0] for v in verts]
-                lats = [v[1] for v in verts]
-                near = not (
-                    max(lons) < minx - pad
-                    or min(lons) > maxx + pad
-                    or max(lats) < miny - pad
-                    or min(lats) > maxy + pad
-                )
-                do_cut = False
-                if near:
-                    do_cut = decisions[turn]
-                    turn += 1
-                if not do_cut:
-                    direct.append(tuple(verts))
-                    kept += 1
-                    continue
-                for piece in cut_triangle(verts, clips, region, melhorar):
-                    made.append(tuple((v[0], v[1], z_for(v, verts), *v[3:]) for v in piece))
-                cut += 1
-                if cut % 2000 == 0:
-                    log("cortando... %d" % cut)
-            if otimizar and begin.split()[1:2] == ["0"]:
-                patch_begin = begin
-                patch_cut.extend(made)
+                begin = pending_begin or "BEGIN_PRIMITIVE 0\n"
+                direct = []
                 made = []
-            if direct or made:
-                fout.write(begin)
-                for piece in direct + made:
-                    for vertex in piece:
-                        fout.write(format_vertex(vertex, vertex[2]))
-                fout.write(line)
+                for verts in triangulos_do_lote(batch):
+                    verificar_cancelamento()
+                    lons = [v[0] for v in verts]
+                    lats = [v[1] for v in verts]
+                    near = not (
+                        max(lons) < minx - pad
+                        or min(lons) > maxx + pad
+                        or max(lats) < miny - pad
+                        or min(lats) > maxy + pad
+                    )
+                    do_cut = False
+                    if near:
+                        do_cut = decisions[turn]
+                        turn += 1
+                    if not do_cut:
+                        direct.append(tuple(verts))
+                        kept += 1
+                        continue
+                    for piece in cortador.cortar(verts):
+                        made.append(tuple((v[0], v[1], z_for(v, verts), *v[3:]) for v in piece))
+                    if cortador.pulou:
+                        pulados += 1
+                    cut += 1
+                    if cut % 2000 == 0:
+                        log("cortando... %d" % cut)
+                if otimizar and begin.split()[1:2] == ["0"]:
+                    patch_begin = begin
+                    patch_cut.extend(made)
+                    made = []
+                if direct or made:
+                    fout.write("BEGIN_PRIMITIVE 0\n")
+                    for piece in direct + made:
+                        for vertex in piece:
+                            fout.write(format_vertex(vertex, vertex[2]))
+                    fout.write(line)
+    finally:
+        cortador.fechar()
     log("triangulos cortados %d, mantidos %d" % (cut, kept))
+    if cortador.recuados:
+        log("triangulos cortados no contorno, sem melhoria de angulo: %d" % cortador.recuados)
+    if pulados:
+        log("triangulos mantidos inteiros porque o corte interno falhou: %d" % pulados)
     if otimizar:
         log("otimizacao: %d pedacos viraram %d" % (before, after))
     return cut
@@ -865,6 +998,7 @@ def recortar_dsf(path, layers, log, proteger_agua=True, blend_m=BLEND_M, otimiza
 PROJETO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 OSM_DIR = os.path.join(PROJETO, "osm")
 LOG_DIR = os.path.join(PROJETO, "logs")
+CACHE_DIR = os.path.join(PROJETO, "cache")
 _log_trava = threading.Lock()
 _log_path = None
 
@@ -885,6 +1019,7 @@ def gravar_log(linha):
     with _log_trava:
         with open(_log_path, "a", encoding="utf-8") as handle:
             handle.write("%s  %s\n" % (time.strftime("%H:%M:%S"), linha))
+            handle.flush()
 EDITOR_DIR = os.path.join(PROJETO, "editor")
 CONFIG_PATH = os.path.join(PROJETO, "config.json")
 PASTA_PADRAO = r"D:\SteamLibrary\steamapps\common\X-Plane 12\XPlane Map Enhancement Data"
@@ -1027,8 +1162,76 @@ def compilar_tile(path, osms, opcoes, log=None):
         raise
 
 
+def servir_cortes():
+    """Processo auxiliar: corta um triângulo por linha e morre sem levar a compilação."""
+    from shapely import wkt
+
+    cabeca = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+    clips = [wkt.loads(texto) for texto in cabeca["clips"]]
+    region = wkt.loads(cabeca["region"])
+    quality = bool(cabeca["quality"])
+    for bruto in sys.stdin.buffer:
+        verts = [tuple(ponto) for ponto in json.loads(bruto.decode("utf-8"))]
+        try:
+            feito = cut_triangle(verts, clips, region, quality)
+            saida = json.dumps(feito)
+        except Exception:
+            saida = json.dumps({"erro": True})
+        sys.stdout.buffer.write((saida + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+
+
+def compilar_um_arquivo(job_path):
+    """Roda um tile neste processo. Se o corte cair, só este processo fecha."""
+    with open(job_path, encoding="utf-8") as handle:
+        job = json.load(handle)
+
+    def escrever(texto):
+        print(texto, flush=True)
+
+    try:
+        resultado = compilar_tile(job["path"], job["osms"], job["opcoes"], escrever)
+    except Exception:
+        print("ERRO\n" + traceback.format_exc(), flush=True)
+        return 1
+    return 0 if resultado == "ok" else 2
+
+
+def rodar_compilacao(path, osms, opcoes, log):
+    """Compila o tile num processo à parte e devolve o código de saída."""
+    global _proc_compile
+    fd, job = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    with open(job, "w", encoding="utf-8") as handle:
+        json.dump({"path": path, "osms": osms, "opcoes": opcoes}, handle)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--compilar-um", job],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW if os.name == "nt" else 0,
+        )
+        with _proc_trava:
+            _proc_compile = proc
+        for raw in proc.stdout:
+            linha = raw.decode("utf-8", errors="replace").rstrip()
+            if linha:
+                log(linha)
+            if cancelar.is_set():
+                matar_arvore(proc.pid)
+                raise Cancelado()
+        return proc.wait()
+    finally:
+        with _proc_trava:
+            _proc_compile = None
+        try:
+            os.remove(job)
+        except OSError:
+            pass
+
+
 def compilar_varios(folder, origens, log, opcoes, progresso=None, paralelo=True):
-    """Compila os OSM marcados, um tile depois do outro, no mesmo processo."""
+    """Compila os OSM marcados, um tile depois do outro."""
     plano = plano_por_tile(folder, origens, log)
     total = len(plano)
     gravar_log("%d tile(s)" % total)
@@ -1036,8 +1239,14 @@ def compilar_varios(folder, origens, log, opcoes, progresso=None, paralelo=True)
         progresso(0, total)
     for feito, (path, osms) in enumerate(plano, start=1):
         gravar_log("inicio " + os.path.basename(path))
-        if compilar_tile(path, osms, opcoes, log) == "cancelado" or cancelar.is_set():
+        codigo = rodar_compilacao(path, osms, opcoes, log)
+        if cancelar.is_set():
             raise Cancelado()
+        if codigo != 0:
+            raise RuntimeError(
+                "A compilação parou no meio de %s (código %s). O cenário só é trocado no fim, então o arquivo anterior continua no lugar."
+                % (os.path.basename(path), codigo)
+            )
         gravar_log("ok " + os.path.basename(path))
         if progresso:
             progresso(feito, total)
@@ -1115,58 +1324,220 @@ def abrir_editor(osm_path):
     webview.start()
 
 
+def assinatura_arquivo(path):
+    st = os.stat(path)
+    marca = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+    return "%s:%d:%d" % (os.path.abspath(path), st.st_size, marca)
+
+
+def chave_cache(partes):
+    return hashlib.sha1("|".join(partes).encode("utf-8")).hexdigest()
+
+
+def ler_cache_tris(chave):
+    path = os.path.join(CACHE_DIR, chave + ".npz")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with numpy.load(path) as data:
+            return numpy.array(data["tris"], dtype=numpy.float64)
+    except Exception:
+        return None
+
+
+def gravar_cache_tris(chave, tris):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    destino = os.path.join(CACHE_DIR, chave + ".npz")
+    tmp = destino + ".part"
+    numpy.savez_compressed(tmp, tris=numpy.asarray(tris, dtype=numpy.float64).reshape(-1, 3, 3))
+    os.replace(tmp + ".npz", destino)
+
+
 def triangulos_do_texto(txt, bbox):
-    """Triângulos que tocam a caixa (oeste, sul, leste, norte), sem repetir as camadas."""
+    """Triângulos cuja caixa toca a área, mesmo quando os três cantos ficam de fora."""
     west, south, east, north = bbox
     seen = set()
-    tris = []
+    bruto = []
     for _line, batch in read_batches(txt):
         if batch is None:
             continue
-        for index in range(0, len(batch) - 2, 3):
-            verts = batch[index : index + 3]
-            if not any(west <= v[0] <= east and south <= v[1] <= north for v in verts):
+        for verts in triangulos_do_lote(batch):
+            lons = (verts[0][0], verts[1][0], verts[2][0])
+            lats = (verts[0][1], verts[1][1], verts[2][1])
+            if max(lons) < west or min(lons) > east or max(lats) < south or min(lats) > north:
                 continue
             key = tuple(sorted(vertex_key(v) for v in verts))
             if key in seen:
                 continue
             seen.add(key)
-            tris.append(tuple((v[0], v[1], v[2]) for v in verts))
-    return tris
+            bruto.append(
+                (
+                    verts[0][0], verts[0][1], verts[0][2],
+                    verts[1][0], verts[1][1], verts[1][2],
+                    verts[2][0], verts[2][1], verts[2][2],
+                )
+            )
+    if not bruto:
+        return numpy.zeros((0, 3, 3), dtype=numpy.float64)
+    return numpy.asarray(bruto, dtype=numpy.float64).reshape(-1, 3, 3)
 
 
 def malha_da_area(path, bbox):
+    chave = chave_cache((assinatura_arquivo(path), "%.5f,%.5f,%.5f,%.5f" % bbox, "malha-tira"))
+    pronto = ler_cache_tris(chave)
+    if pronto is not None:
+        return pronto, True
     work = tempfile.mkdtemp(prefix="visor_")
     try:
         raw, _compressed = load_dsf(path, work)
         txt = os.path.join(work, "tile.txt")
         run_quiet([dsf_tool(), "--dsf2text", raw, txt])
-        return triangulos_do_texto(txt, bbox)
+        tris = triangulos_do_texto(txt, bbox)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    gravar_cache_tris(chave, tris)
+    return tris, False
 
 
-def previa_da_area(path, layers, bbox, blend_m, otimizar, log, melhorar=False):
+def previa_da_area(path, layers, bbox, blend_m, otimizar, log, melhorar=False, marca=""):
     """Corta o original em memória, sem gravar o DSF, e devolve os triângulos da área."""
+    backup = path + ".antes_osm"
+    fonte = backup if os.path.isfile(backup) else path
+    chave = chave_cache(
+        (
+            assinatura_arquivo(fonte),
+            "%.5f,%.5f,%.5f,%.5f" % bbox,
+            "previa",
+            "%.3f" % blend_m,
+            "1" if otimizar else "0",
+            "1" if melhorar else "0",
+            marca,
+        )
+    )
+    pronto = ler_cache_tris(chave)
+    if pronto is not None:
+        return pronto, True
     work = tempfile.mkdtemp(prefix="previa_")
     try:
         out_txt = cortar_em_texto(path, work, layers, log, True, blend_m, otimizar, melhorar)
-        return triangulos_do_texto(out_txt, bbox)
+        tris = triangulos_do_texto(out_txt, bbox)
     finally:
         shutil.rmtree(work, ignore_errors=True)
+    gravar_cache_tris(chave, tris)
+    return tris, False
 
 
-def cor_altura(z, low, high):
+def cor_rgb(z, low, high):
     if z <= SEA_M:
-        return "#1d4f8c"
+        return (29, 79, 140)
     t = 0.0 if high <= low else min(max((z - low) / (high - low), 0.0), 1.0)
     stops = ((0.0, (60, 140, 70)), (0.5, (200, 190, 90)), (1.0, (190, 90, 50)))
     for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
         if t <= t1:
             k = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
-            rgb = [int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)]
-            return "#%02x%02x%02x" % tuple(rgb)
-    return "#be5a32"
+            return tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3))
+    return (190, 90, 50)
+
+
+def vista_com_aspecto(west, south, east, north, largura, altura):
+    """Abre a caixa até a proporção da janela, para o pixel continuar quadrado."""
+    meio = (south + north) * 0.5
+    m_lon = 111320.0 * cos(radians(meio))
+    mundo_w = max(east - west, 1e-8) * m_lon
+    mundo_h = max(north - south, 1e-8) * 111320.0
+    tela = largura / float(altura)
+    if mundo_w / mundo_h < tela:
+        mundo_w = mundo_h * tela
+    else:
+        mundo_h = mundo_w / tela
+    cx = (west + east) * 0.5
+    cy = (south + north) * 0.5
+    return (
+        cx - mundo_w * 0.5 / m_lon,
+        cy - mundo_h * 0.5 / 111320.0,
+        cx + mundo_w * 0.5 / m_lon,
+        cy + mundo_h * 0.5 / 111320.0,
+    )
+
+
+def grade_dos_tris(tris):
+    quantidade = len(tris)
+    if quantidade == 0:
+        return None
+    west = float(tris[:, :, 0].min())
+    east = float(tris[:, :, 0].max())
+    south = float(tris[:, :, 1].min())
+    north = float(tris[:, :, 1].max())
+    cols = rows = 96
+    cw = max(east - west, 1e-12) / cols
+    ch = max(north - south, 1e-12) / rows
+    cells = [[] for _ in range(cols * rows)]
+    for indice in range(quantidade):
+        tri = tris[indice]
+        c0 = int((float(tri[:, 0].min()) - west) / cw)
+        c1 = int((float(tri[:, 0].max()) - west) / cw)
+        r0 = int((float(tri[:, 1].min()) - south) / ch)
+        r1 = int((float(tri[:, 1].max()) - south) / ch)
+        c0 = min(max(c0, 0), cols - 1)
+        c1 = min(max(c1, 0), cols - 1)
+        r0 = min(max(r0, 0), rows - 1)
+        r1 = min(max(r1, 0), rows - 1)
+        for linha in range(r0, r1 + 1):
+            base = linha * cols
+            for coluna in range(c0, c1 + 1):
+                cells[base + coluna].append(indice)
+    return {"cells": cells, "west": west, "south": south, "cw": cw, "ch": ch, "cols": cols, "rows": rows}
+
+
+def ponto_no_triangulo(lon, lat, tri):
+    x0, y0 = tri[0, 0], tri[0, 1]
+    x1, y1 = tri[1, 0], tri[1, 1]
+    x2, y2 = tri[2, 0], tri[2, 1]
+    denominador = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if denominador == 0:
+        return False
+    a = ((y1 - y2) * (lon - x2) + (x2 - x1) * (lat - y2)) / denominador
+    b = ((y2 - y0) * (lon - x2) + (x0 - x2) * (lat - y2)) / denominador
+    c = 1.0 - a - b
+    return a >= -1e-8 and b >= -1e-8 and c >= -1e-8
+
+
+def triangulo_na_grade(grade, tris, lon, lat):
+    if not grade:
+        return None
+    coluna = int((lon - grade["west"]) / grade["cw"])
+    linha = int((lat - grade["south"]) / grade["ch"])
+    if coluna < 0 or linha < 0 or coluna >= grade["cols"] or linha >= grade["rows"]:
+        return None
+    for indice in grade["cells"][linha * grade["cols"] + coluna]:
+        tri = tris[indice]
+        if ponto_no_triangulo(lon, lat, tri):
+            return tri
+    return None
+
+
+def raster_malha(tris, vista, largura, altura, low, high, aneis):
+    """Uma imagem só. A janela não aguenta um polígono do Tk por triângulo."""
+    from PIL import Image, ImageDraw
+
+    west, south, east, north = vista
+    imagem = Image.new("RGB", (largura, altura), (17, 17, 17))
+    draw = ImageDraw.Draw(imagem)
+    m_lon = 111320.0 * cos(radians((south + north) * 0.5))
+    sx = largura / max((east - west) * m_lon, 1e-6)
+    sy = altura / max((north - south) * 111320.0, 1e-6)
+    for tri in tris:
+        lons = tri[:, 0]
+        lats = tri[:, 1]
+        if float(lons.max()) < west or float(lons.min()) > east or float(lats.max()) < south or float(lats.min()) > north:
+            continue
+        pontos = [((float(lon) - west) * m_lon * sx, (north - float(lat)) * 111320.0 * sy) for lon, lat in zip(lons, lats)]
+        draw.polygon(pontos, fill=cor_rgb(float(tri[:, 2].mean()), low, high), outline=(0, 0, 0))
+    for anel, cor in aneis:
+        pontos = [((lon - west) * m_lon * sx, (north - lat) * 111320.0 * sy) for lon, lat in anel]
+        if len(pontos) >= 2:
+            draw.line(pontos, fill=cor, width=2)
+    return imagem
 
 
 class VisorMalha(tk.Toplevel):
@@ -1180,13 +1551,29 @@ class VisorMalha(tk.Toplevel):
         self.osm = osm
         self.fonte = tk.StringVar(value="atual")
         self.info = tk.StringVar(value="Lendo o DSF…")
-        self.itens = {}
+        self.tris = None
+        self.grade = None
+        self.low = 0.0
+        self.high = 1.0
+        self.foto = None
+        self.vista = None
+        self._vista_pedida = None
+        self._zoom_origem = None
+        self._ox = 0.0
+        self._oy = 0.0
+        self._k = 1.0
+        self._sx = 1.0
+        self._sy = 1.0
+        self._arrasto = None
+        self._moveu = False
+        self._raster_pedido = 0
+        self._tela = (0, 0)
         topo = ttk.Frame(self)
         topo.pack(fill="x", padx=8, pady=6)
-        ttk.Radiobutton(topo, text="Compilado", variable=self.fonte, value="atual", command=self.carregar).pack(side="left")
-        ttk.Radiobutton(topo, text="Original (.antes_osm)", variable=self.fonte, value="original", command=self.carregar).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(topo, text="Prévia normal", variable=self.fonte, value="previa", command=self.carregar).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(topo, text="Prévia otimizada", variable=self.fonte, value="otimizada", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(topo, text="Atual", variable=self.fonte, value="atual", command=self.carregar).pack(side="left")
+        ttk.Radiobutton(topo, text="Original", variable=self.fonte, value="original", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(topo, text="Prévia", variable=self.fonte, value="previa", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Button(topo, text="Gerar prévia", command=self.gerar_previa).pack(side="left", padx=(8, 0))
         ttk.Label(topo, textvariable=self.info).pack(side="left", padx=12)
         self.canvas = tk.Canvas(self, background="#111111", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -1198,15 +1585,29 @@ class VisorMalha(tk.Toplevel):
             rodape,
             text="Roda: zoom   Arrastar: mover   Botão direito: copiar coordenada",
         ).pack(side="right")
-        self.transf = None
         self.canvas.bind("<MouseWheel>", self.zoom)
         self.canvas.bind("<ButtonPress-3>", self.copiar_coordenada)
-        self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
-        self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+        self.canvas.bind("<ButtonPress-1>", self.iniciar_arrasto)
+        self.canvas.bind("<B1-Motion>", self.arrastar)
+        self.canvas.bind("<ButtonRelease-1>", self.soltar)
         self.canvas.bind("<Motion>", self.mostrar_altura)
+        self.canvas.bind("<Configure>", self.redimensionar)
         self.flats, self.ramps, bounds = load_patch(osm)
         pad = 250.0 / 111320.0
         self.bbox = (bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)
+        self.aneis = [(list(polygon.exterior.coords), (255, 59, 59)) for polygon, _alt in self.flats]
+        self.aneis += [(list(polygon.exterior.coords), (255, 159, 26)) for polygon, *_rest in self.ramps]
+        self.after(60, self.carregar)
+
+    def _config_atual(self):
+        try:
+            faixa = ler_faixa(self.master.faixa.get())
+        except Exception:
+            faixa = self.blend_m
+        return faixa, bool(self.master.otimizar.get()), bool(self.master.melhorar.get())
+
+    def gerar_previa(self):
+        self.fonte.set("previa")
         self.carregar()
 
     def carregar(self):
@@ -1228,109 +1629,208 @@ class VisorMalha(tk.Toplevel):
         if not escolhidos:
             self.info.set("Esse tile ainda não tem backup .antes_osm.")
             return
-        self.canvas.delete("all")
-        previa = fonte in ("previa", "otimizada")
-        self.info.set("Cortando em memória, leva alguns minutos…" if previa else "Lendo o DSF…")
+        previa = fonte == "previa"
+        blend_m, otimizar, melhorar = self._config_atual()
+        self.blend_m = blend_m
+        self.info.set(
+            "Prévia com a configuração atual…" if previa else "Lendo o DSF…"
+        )
         bbox = self.bbox
         layers = layers_of(self.flats, self.ramps)
-        blend_m = self.blend_m
-        melhorar = self.melhorar
+        marca = assinatura_arquivo(self.osm) if previa else ""
 
         def aviso(texto):
             self.after(0, lambda: pedido == self.pedido and self.info.set("Prévia: " + texto))
 
         def trabalho():
             try:
-                tris = []
+                partes = []
+                do_cache = True
                 for path in escolhidos:
                     if previa:
-                        tris.extend(previa_da_area(path, layers, bbox, blend_m, fonte == "otimizada", aviso, melhorar))
+                        tris, usou = previa_da_area(
+                            path, layers, bbox, blend_m, otimizar, aviso, melhorar, marca
+                        )
                     else:
-                        tris.extend(malha_da_area(path, bbox))
+                        tris, usou = malha_da_area(path, bbox)
+                    do_cache = do_cache and usou
+                    partes.append(tris)
+                if not partes:
+                    juntos = numpy.zeros((0, 3, 3), dtype=numpy.float64)
+                else:
+                    juntos = numpy.concatenate(partes, axis=0)
+                grade = grade_dos_tris(juntos)
             except Exception as exc:
                 self.after(0, lambda exc=exc: pedido == self.pedido and self.info.set("Erro: " + str(exc)))
                 return
-            self.after(0, lambda: pedido == self.pedido and self.desenhar(tris))
+            self.after(0, lambda: pedido == self.pedido and self.receber(juntos, grade, do_cache))
 
         threading.Thread(target=trabalho, daemon=True).start()
 
-    def desenhar(self, tris):
+    def receber(self, tris, grade, do_cache):
         if not self.winfo_exists():
             return
-        self.canvas.delete("all")
-        self.itens = {}
-        west, south, east, north = self.bbox
+        self.tris = tris
+        self.grade = grade
+        if len(tris):
+            zs = tris[:, :, 2]
+            acima = zs[zs > SEA_M]
+            self.low = float(acima.min()) if acima.size else 0.0
+            self.high = float(acima.max()) if acima.size else 1.0
+        else:
+            self.low, self.high = 0.0, 1.0
+        nome = {"atual": "atual", "original": "original", "previa": "prévia"}[self.fonte.get()]
+        origem = "cache" if do_cache else "lido agora"
+        if self.fonte.get() == "previa":
+            _, otimizar, melhorar = self._config_atual()
+            origem += "   otimizar %s   melhorar %s" % (
+                "sim" if otimizar else "não",
+                "sim" if melhorar else "não",
+            )
+        self.info.set(
+            "%s: %d triângulos na área   altura %.1f a %.1f m   %s"
+            % (nome, len(tris), self.low, self.high, origem)
+        )
+        self.vista = None
+        self._vista_pedida = None
+        self._pedir_raster(self.bbox, ajustar=True)
+
+    def _pedir_raster(self, caixa, ajustar=False):
+        if self.tris is None or not self.winfo_exists():
+            return
+        largura = self.canvas.winfo_width()
+        altura = self.canvas.winfo_height()
+        if largura < 50 or altura < 50:
+            self.after(50, lambda: self._pedir_raster(caixa, ajustar))
+            return
+        if ajustar:
+            vista = vista_com_aspecto(caixa[0], caixa[1], caixa[2], caixa[3], largura, altura)
+        else:
+            vista = caixa
+        self._raster_pedido += 1
+        pedido = self._raster_pedido
+        tris = self.tris
+        low, high = self.low, self.high
+        aneis = self.aneis
+
+        def trabalho():
+            try:
+                imagem = raster_malha(tris, vista, largura, altura, low, high, aneis)
+            except Exception as exc:
+                self.after(0, lambda exc=exc: pedido == self._raster_pedido and self.info.set("Erro ao desenhar: " + str(exc)))
+                return
+            self.after(0, lambda: pedido == self._raster_pedido and self.mostrar_imagem(imagem, vista))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def mostrar_imagem(self, imagem, vista):
+        if not self.winfo_exists():
+            return
+        from PIL import ImageTk
+
+        west, south, east, north = vista
+        largura, altura = imagem.size
         m_lon = 111320.0 * cos(radians((south + north) * 0.5))
-        largura = max(self.canvas.winfo_width(), 400)
-        altura = max(self.canvas.winfo_height(), 300)
-        escala = min(largura / ((east - west) * m_lon), altura / ((north - south) * 111320.0))
+        self.vista = vista
+        self._ox = 0.0
+        self._oy = 0.0
+        self._k = 1.0
+        self._zoom_origem = None
+        if self._vista_pedida == vista:
+            self._vista_pedida = None
+        self._sx = largura / max((east - west) * m_lon, 1e-6)
+        self._sy = altura / max((north - south) * 111320.0, 1e-6)
+        self._tela = (largura, altura)
+        self.foto = ImageTk.PhotoImage(imagem)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, image=self.foto, anchor="nw", tags="mapa")
 
-        def xy(lon, lat):
-            return ((lon - west) * m_lon * escala, (north - lat) * 111320.0 * escala)
-
-        self.transf = {"west": west, "north": north, "sx": m_lon * escala, "sy": 111320.0 * escala, "k": 1.0, "ox": 0.0, "oy": 0.0}
-
-        zs = [v[2] for tri in tris for v in tri if v[2] > SEA_M]
-        low = min(zs) if zs else 0.0
-        high = max(zs) if zs else 1.0
-        for tri in tris:
-            z = sum(v[2] for v in tri) / 3.0
-            coords = [c for v in tri for c in xy(v[0], v[1])]
-            item = self.canvas.create_polygon(coords, fill=cor_altura(z, low, high), outline="#000000", width=1)
-            self.itens[item] = tri
-        for polygon, _alt in self.flats:
-            coords = [c for lon, lat in polygon.exterior.coords for c in xy(lon, lat)]
-            self.canvas.create_line(coords, fill="#ff3b3b", width=2)
-        for polygon, *_rest in self.ramps:
-            coords = [c for lon, lat in polygon.exterior.coords for c in xy(lon, lat)]
-            self.canvas.create_line(coords, fill="#ff9f1a", width=2)
-        nome = {
-            "atual": "compilado",
-            "original": "original",
-            "previa": "prévia normal",
-            "otimizada": "prévia otimizada",
-        }[self.fonte.get()]
-        self.info.set("%s: %d triângulos na área   altura %.1f a %.1f m" % (nome, len(tris), low, high))
+    def redimensionar(self, event):
+        if self.tris is None or self.vista is None or self._moveu:
+            return
+        if abs(event.width - self._tela[0]) < 12 and abs(event.height - self._tela[1]) < 12:
+            return
+        pendente = getattr(self, "_resize", None)
+        if pendente:
+            self.after_cancel(pendente)
+        self._resize = self.after(200, lambda: self._pedir_raster(self.vista, ajustar=True))
 
     def zoom(self, event):
+        if self.vista is None:
+            return
         fator = 1.25 if event.delta > 0 else 0.8
-        x = self.canvas.canvasx(event.x)
-        y = self.canvas.canvasy(event.y)
+        if self._zoom_origem is None:
+            self._zoom_origem = self.vista
+            self._zoom_xy = (event.x, event.y)
+            self._zoom_fator = 1.0
+        self._zoom_fator *= fator
+        x, y = self._zoom_xy
+        caixa = self._zoom_caixa(self._zoom_origem, x, y, self._zoom_fator)
+        self._vista_pedida = caixa
         pendente = getattr(self, "_zoom", None)
         if pendente:
-            self.after_cancel(pendente[0])
-            fator *= pendente[1]
-        self._zoom = (self.after(120, lambda: self._aplicar_zoom(x, y)), fator)
+            self.after_cancel(pendente)
+        self._zoom = self.after(80, lambda caixa=caixa: self._pedir_raster(caixa, ajustar=False))
 
-    def _aplicar_zoom(self, x, y):
-        fator = self._zoom[1]
-        self._zoom = None
-        self.canvas.scale("all", x, y, fator, fator)
-        if self.transf:
-            t = self.transf
-            t["k"] *= fator
-            t["ox"] = x + (t["ox"] - x) * fator
-            t["oy"] = y + (t["oy"] - y) * fator
+    def _zoom_caixa(self, caixa, x, y, fator):
+        west, south, east, north = caixa
+        largura = max(self.canvas.winfo_width(), 1)
+        altura = max(self.canvas.winfo_height(), 1)
+        lon = west + (east - west) * (x / largura)
+        lat = north - (north - south) * (y / altura)
+        span_lon = min(max((east - west) / fator, 1e-6), 40.0)
+        span_lat = min(max((north - south) / fator, 1e-6), 40.0)
+        esquerda = lon - span_lon * (x / largura)
+        cima = lat + span_lat * (y / altura)
+        return (esquerda, cima - span_lat, esquerda + span_lon, cima)
+
+    def iniciar_arrasto(self, event):
+        self._arrasto = (event.x, event.y)
+        self._moveu = False
+
+    def arrastar(self, event):
+        if not self._arrasto or self.vista is None:
+            return
+        dx = event.x - self._arrasto[0]
+        dy = event.y - self._arrasto[1]
+        if dx or dy:
+            self._moveu = True
+        self._arrasto = (event.x, event.y)
+        self._ox += dx
+        self._oy += dy
+        self.canvas.move("mapa", dx, dy)
+
+    def soltar(self, event):
+        if self._arrasto is None or self.vista is None or not self._moveu:
+            self._arrasto = None
+            return
+        self._arrasto = None
+        self._zoom_origem = None
+        west, south, east, north = self.vista
+        m_lon = 111320.0 * cos(radians((south + north) * 0.5))
+        dlon = -self._ox / self._sx / m_lon
+        dlat = self._oy / self._sy / 111320.0
+        self._vista_pedida = (west + dlon, south + dlat, east + dlon, north + dlat)
+        self._pedir_raster(self._vista_pedida, ajustar=False)
+
+    def _mundo(self, x, y):
+        bx = x - self._ox
+        by = y - self._oy
+        return (self.vista[3] - by / self._sy, self.vista[0] + bx / self._sx)
 
     def coordenada(self, event):
-        if not self.transf:
+        if self.vista is None:
             return None
-        t = self.transf
-        cx = self.canvas.canvasx(event.x)
-        cy = self.canvas.canvasy(event.y)
-        bx = (cx - t["ox"]) / t["k"]
-        by = (cy - t["oy"]) / t["k"]
-        return (t["north"] - by / t["sy"], t["west"] + bx / t["sx"])
+        return self._mundo(event.x, event.y)
 
     def mostrar_altura(self, event):
         ponto = self.coordenada(event)
         if ponto is None:
             return
         texto = "lat %.7f   lon %.7f" % ponto
-        atual = self.canvas.find_withtag("current")
-        if atual and atual[0] in self.itens:
-            tri = self.itens[atual[0]]
-            texto += "   vértices: %s m" % ", ".join("%.2f" % v[2] for v in tri)
+        tri = triangulo_na_grade(self.grade, self.tris, ponto[1], ponto[0])
+        if tri is not None:
+            texto += "   vértices: %s m" % ", ".join("%.2f" % float(v) for v in tri[:, 2])
         self.posicao.set(texto)
 
     def copiar_coordenada(self, event):
@@ -1720,4 +2220,9 @@ if __name__ == "__main__":
 
     if "--compilar-todos" in sys.argv:
         sys.exit(compilar_todos())
+    if "--compilar-um" in sys.argv:
+        sys.exit(compilar_um_arquivo(sys.argv[sys.argv.index("--compilar-um") + 1]))
+    if "--cortar" in sys.argv:
+        servir_cortes()
+        sys.exit(0)
     App().mainloop()

@@ -5,3 +5,4 @@ __pycache__/
 config.json
 editor/editor-config.json
 logs/
+cache/

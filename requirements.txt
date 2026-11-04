@@ -2,3 +2,4 @@ numpy==2.5.2
 shapely==2.1.2
 triangle==20250106
 pywebview==6.2.1
+pillow==12.3.0
