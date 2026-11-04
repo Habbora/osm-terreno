@@ -10,7 +10,7 @@
   --warn: #ffb070;
   --danger: #ff6b7a;
   --blue: #7ec8ff;
-  --top: 90px;
+  --top: 96px;
   --left: 300px;
   --right: 312px;
   --bot: 26px;
@@ -69,7 +69,7 @@ a { color: var(--blue); }
   padding: 0 10px; min-height: 42px; flex: 1 0 auto;
 }
 .top-row.cmds {
-  min-height: 48px; flex: 0 0 48px;
+  min-height: 52px; flex: 1 1 auto;
   border-top: 1px solid var(--line);
   background: #0c1524;
   overflow-x: auto;

@@ -4,3 +4,4 @@ __pycache__/
 *.osm.bak
 config.json
 editor/editor-config.json
+logs/

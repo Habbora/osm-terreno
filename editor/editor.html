@@ -29,18 +29,6 @@
       <button id="btnOpen" title="Abrir um .osm do disco e passar a gravar nele">Abrir…</button>
       <input id="file" type="file" accept=".osm,.xml" hidden>
     </div>
-    <i class="sep"></i>
-    <div class="grp">
-      <button id="btnSat" class="active" title="Satélite Esri">Sat</button>
-      <button id="btnOsm" title="Mapa OSM">OSM</button>
-      <button id="btnTopo" title="Relevo">Topo</button>
-      <button id="btnFit" title="Enquadrar tudo">⊡</button>
-      <button id="btnZoomSel" title="Enquadrar seleção (Z)">⊞</button>
-      <button id="btnTile" title="Limite do tile 1°">Tile</button>
-      <button id="btnRef" title="Pistas e água do OSM (referência)">OSM ref</button>
-      <button id="btnLabels" class="active" title="Rótulos no mapa">Abc</button>
-      <label class="op" title="Opacidade dos polígonos">Op <input id="op" type="range" min="10" max="80" value="40"></label>
-    </div>
     <span class="grow"></span>
     <button id="btnHelp" title="Atalhos (?)">?</button>
   </div>
@@ -65,6 +53,18 @@
       <button class="ico" data-mode="elev" title="Amostrar DEM (H)">DEM</button>
     </div>
     <i class="sep"></i>
+    <div class="grp lab" data-lab="Mapa">
+      <button id="btnSat" class="active" title="Satélite Esri">Sat</button>
+      <button id="btnOsm" title="Mapa OSM">OSM</button>
+      <button id="btnTopo" title="Relevo">Topo</button>
+      <button id="btnFit" title="Enquadrar tudo">⊡</button>
+      <button id="btnZoomSel" title="Enquadrar seleção (Z)">⊞</button>
+      <button id="btnTile" title="Limite do tile 1°">Tile</button>
+      <button id="btnRef" title="Pistas e água do OSM (referência)">Ref</button>
+      <button id="btnLabels" class="active" title="Rótulos no mapa">Abc</button>
+      <label class="op" title="Opacidade dos polígonos">Op <input id="op" type="range" min="10" max="80" value="40"></label>
+    </div>
+    <i class="sep"></i>
     <div class="grp lab" data-lab="Desenhar">
       <button class="ico" data-mode="draw" data-kind="flat" title="Desenhar flatten (F)">Flatten</button>
       <button class="ico" data-mode="draw" data-kind="ramp" title="Desenhar rampa (P)">Rampa</button>
@@ -79,26 +79,7 @@
 </header>
 
 <aside id="tools">
-  <div id="projeto">
-    <h2>Terreno</h2>
-    <div class="row wrap">
-      <input id="pastaTerreno" type="text" spellcheck="false">
-      <button id="btnPasta" type="button">Pasta</button>
-    </div>
-    <div id="osmChecks"></div>
-    <div class="row wrap">
-      <button id="btnMarcar" type="button">Selecionar tudo</button>
-      <button id="btnDesmarcar" type="button">Desmarcar tudo</button>
-      <button id="btnImportar" type="button">Importar</button>
-      <button id="btnExportar" type="button">Exportar</button>
-      <button id="btnApagarOsm" type="button">Apagar</button>
-      <button id="btnCompilar" type="button" class="primary">Compilar</button>
-      <button id="btnRecuperar" type="button">Recuperar</button>
-    </div>
-    <input id="fileImport" type="file" accept=".osm,.xml" multiple hidden>
-    <pre id="logTerreno"></pre>
-  </div>
-  <p class="hint" id="toolHint">Modo área. Shift+clique na segunda área e <kbd>W</kbd> une numa só. <kbd>J</kbd> cria rampa.</p>
+  <p class="hint" id="toolHint">Modo área. Shift+clique na segunda área e <kbd>W</kbd> une numa só. <kbd>J</kbd> cria rampa. <kbd>Ctrl+S</kbd> salva.</p>
   <label class="check"><input id="chkSnap" type="checkbox" checked> Snap em nós <kbd>G</kbd></label>
   <label class="check"><input id="chkLabels" type="checkbox" checked> Rótulos no mapa</label>
 
@@ -322,6 +303,5 @@
 </dialog>
 
 <script src="editor.js"></script>
-<script src="painel.js"></script>
 </body>
 </html>

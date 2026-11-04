@@ -15,14 +15,16 @@ import struct
 import subprocess
 import tempfile
 import threading
+import traceback
 import time
 import multiprocessing
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 import tkinter as tk
 import webbrowser
 import xml.etree.ElementTree as ET
 from math import cos, hypot, radians, tanh
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy
 import triangle
@@ -741,17 +743,7 @@ def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, 
         z_value = height_on_mesh(vertex[0], vertex[1], layers, m_lon, dem_z, proteger_agua, blend_m)
         return vertex[2] if z_value is None else z_value
 
-    nucleos = os.cpu_count() or 2
-    if _fila_log is not None:
-        workers = max(2, nucleos // 2)
-    else:
-        workers = max(2, nucleos - 1)
-    log("cortando os triangulos em %d nucleos" % workers)
-
-    def cortar_um(verts):
-        verificar_cancelamento()
-        return [tuple((v[0], v[1], z_for(v, verts), *v[3:]) for v in piece) for piece in cut_triangle(verts, clips, region, melhorar)]
-
+    log("cortando os triangulos")
     kept = 0
     cut = 0
     turn = 0
@@ -759,71 +751,66 @@ def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, 
     after = 0
     pending_begin = None
     patch_cut = []
-    pool = ThreadPoolExecutor(max_workers=workers)
-    try:
-        def write_block(begin, pieces):
-            for start in range(0, len(pieces), 2000):
+
+    def write_block(begin, pieces):
+        for start in range(0, len(pieces), 2000):
+            fout.write(begin)
+            for piece in pieces[start : start + 2000]:
+                for vertex in piece:
+                    fout.write(format_vertex(vertex, vertex[2]))
+            fout.write("END_PRIMITIVE\n")
+
+    with open(dst, "w", encoding="utf-8", newline="\n") as fout:
+        for line, batch in read_batches(src):
+            if batch is None:
+                if line.startswith("BEGIN_PRIMITIVE"):
+                    pending_begin = line
+                    continue
+                if line.startswith("END_PATCH") and patch_cut:
+                    before += len(patch_cut)
+                    merged = merge_flat(patch_cut)
+                    after += len(merged)
+                    write_block(patch_begin, merged)
+                    patch_cut = []
+                fout.write(line)
+                continue
+            begin = pending_begin or "BEGIN_PRIMITIVE 0\n"
+            direct = []
+            made = []
+            for index in range(0, len(batch) - 2, 3):
+                verificar_cancelamento()
+                verts = batch[index : index + 3]
+                lons = [v[0] for v in verts]
+                lats = [v[1] for v in verts]
+                near = not (
+                    max(lons) < minx - pad
+                    or min(lons) > maxx + pad
+                    or max(lats) < miny - pad
+                    or min(lats) > maxy + pad
+                )
+                do_cut = False
+                if near:
+                    do_cut = decisions[turn]
+                    turn += 1
+                if not do_cut:
+                    direct.append(tuple(verts))
+                    kept += 1
+                    continue
+                for piece in cut_triangle(verts, clips, region, melhorar):
+                    made.append(tuple((v[0], v[1], z_for(v, verts), *v[3:]) for v in piece))
+                cut += 1
+                if cut % 2000 == 0:
+                    log("cortando... %d" % cut)
+            if otimizar and begin.split()[1:2] == ["0"]:
+                patch_begin = begin
+                patch_cut.extend(made)
+                made = []
+            if direct or made:
                 fout.write(begin)
-                for piece in pieces[start : start + 2000]:
+                for piece in direct + made:
                     for vertex in piece:
                         fout.write(format_vertex(vertex, vertex[2]))
-                fout.write("END_PRIMITIVE\n")
-
-        with open(dst, "w", encoding="utf-8", newline="\n") as fout:
-            for line, batch in read_batches(src):
-                if batch is None:
-                    if line.startswith("BEGIN_PRIMITIVE"):
-                        pending_begin = line
-                        continue
-                    if line.startswith("END_PATCH") and patch_cut:
-                        before += len(patch_cut)
-                        merged = merge_flat(patch_cut)
-                        after += len(merged)
-                        write_block(patch_begin, merged)
-                        patch_cut = []
-                    fout.write(line)
-                    continue
-                begin = pending_begin or "BEGIN_PRIMITIVE 0\n"
-                direct = []
-                made = []
-                futuros = []
-                for index in range(0, len(batch) - 2, 3):
-                    verificar_cancelamento()
-                    verts = batch[index : index + 3]
-                    lons = [v[0] for v in verts]
-                    lats = [v[1] for v in verts]
-                    near = not (
-                        max(lons) < minx - pad
-                        or min(lons) > maxx + pad
-                        or max(lats) < miny - pad
-                        or min(lats) > maxy + pad
-                    )
-                    do_cut = False
-                    if near:
-                        do_cut = decisions[turn]
-                        turn += 1
-                    if not do_cut:
-                        direct.append(tuple(verts))
-                        kept += 1
-                        continue
-                    futuros.append(pool.submit(cortar_um, tuple(verts)))
-                    cut += 1
-                    if cut % 2000 == 0:
-                        log("cortando... %d" % cut)
-                for futuro in futuros:
-                    made.extend(futuro.result())
-                if otimizar and begin.split()[1:2] == ["0"]:
-                    patch_begin = begin
-                    patch_cut.extend(made)
-                    made = []
-                if direct or made:
-                    fout.write(begin)
-                    for piece in direct + made:
-                        for vertex in piece:
-                            fout.write(format_vertex(vertex, vertex[2]))
-                    fout.write(line)
-    finally:
-        pool.shutdown(wait=True)
+                fout.write(line)
     log("triangulos cortados %d, mantidos %d" % (cut, kept))
     if otimizar:
         log("otimizacao: %d pedacos viraram %d" % (before, after))
@@ -877,6 +864,27 @@ def recortar_dsf(path, layers, log, proteger_agua=True, blend_m=BLEND_M, otimiza
 
 PROJETO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 OSM_DIR = os.path.join(PROJETO, "osm")
+LOG_DIR = os.path.join(PROJETO, "logs")
+_log_trava = threading.Lock()
+_log_path = None
+
+
+def iniciar_log(titulo):
+    """Reescreve logs/Log.txt com esta compilação. A anterior sai."""
+    global _log_path
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _log_path = os.path.join(LOG_DIR, "Log.txt")
+    with open(_log_path, "w", encoding="utf-8") as handle:
+        handle.write("%s\n%s\n\n" % (titulo, time.strftime("%Y-%m-%d %H:%M:%S")))
+    return _log_path
+
+
+def gravar_log(linha):
+    if not _log_path:
+        return
+    with _log_trava:
+        with open(_log_path, "a", encoding="utf-8") as handle:
+            handle.write("%s  %s\n" % (time.strftime("%H:%M:%S"), linha))
 EDITOR_DIR = os.path.join(PROJETO, "editor")
 CONFIG_PATH = os.path.join(PROJETO, "config.json")
 PASTA_PADRAO = r"D:\SteamLibrary\steamapps\common\X-Plane 12\XPlane Map Enhancement Data"
@@ -1012,75 +1020,27 @@ def compilar_tile(path, osms, opcoes, log=None):
         escrever("pronto em %.0f s" % (time.time() - inicio))
         return "ok"
     except Cancelado:
+        gravar_log(nome + "  cancelado")
         return "cancelado"
-    except Exception as exc:
-        raise RuntimeError("%s: %s" % (nome, exc)) from None
+    except Exception:
+        gravar_log(nome + "  ERRO\n" + traceback.format_exc())
+        raise
 
 
 def compilar_varios(folder, origens, log, opcoes, progresso=None, paralelo=True):
-    """Compila os OSM marcados agrupados por tile. Tiles diferentes rodam ao mesmo tempo."""
-    global _evento_processos
+    """Compila os OSM marcados, um tile depois do outro, no mesmo processo."""
     plano = plano_por_tile(folder, origens, log)
     total = len(plano)
+    gravar_log("%d tile(s)" % total)
     if progresso:
         progresso(0, total)
-    if not paralelo or total == 1:
-        for feito, (path, osms) in enumerate(plano, start=1):
-            if compilar_tile(path, osms, opcoes, log) == "cancelado" or cancelar.is_set():
-                raise Cancelado()
-            if progresso:
-                progresso(feito, total)
-        return total
-    contexto = multiprocessing.get_context("spawn")
-    evento = contexto.Event()
-    fila = contexto.Queue()
-    _evento_processos = evento
-    if cancelar.is_set():
-        evento.set()
-    nucleos = os.cpu_count() or 2
-    processos = max(1, min(total, nucleos - 1))
-    log("%d tiles, %d ao mesmo tempo" % (total, processos))
-
-    def esvaziar():
-        while True:
-            try:
-                log(fila.get_nowait())
-            except Exception:
-                return
-
-    feito = 0
-    erro = None
-    try:
-        with ProcessPoolExecutor(
-            max_workers=processos,
-            mp_context=contexto,
-            initializer=_iniciar_processo,
-            initargs=(evento, fila),
-        ) as pool:
-            pendentes = {pool.submit(compilar_tile, path, osms, opcoes) for path, osms in plano}
-            while pendentes:
-                prontos, pendentes = wait(pendentes, timeout=0.3, return_when=FIRST_COMPLETED)
-                esvaziar()
-                if cancelar.is_set():
-                    evento.set()
-                for futuro in prontos:
-                    try:
-                        resultado = futuro.result()
-                    except Exception as exc:
-                        erro = erro or exc
-                        evento.set()
-                        continue
-                    if resultado == "ok":
-                        feito += 1
-                        if progresso:
-                            progresso(feito, total)
-            esvaziar()
-    finally:
-        _evento_processos = None
-    if erro is not None:
-        raise erro
-    if cancelar.is_set():
-        raise Cancelado()
+    for feito, (path, osms) in enumerate(plano, start=1):
+        gravar_log("inicio " + os.path.basename(path))
+        if compilar_tile(path, osms, opcoes, log) == "cancelado" or cancelar.is_set():
+            raise Cancelado()
+        gravar_log("ok " + os.path.basename(path))
+        if progresso:
+            progresso(feito, total)
     return total
 
 
@@ -1412,24 +1372,18 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True, **pad)
         left = ttk.Frame(body)
         left.pack(side="left", fill="both", expand=True)
-        ttk.Label(left, text="OSM").pack(anchor="w")
-        self.marcas = {}
+        ttk.Label(left, text="OSM  ·  clique para selecionar, Ctrl para vários").pack(anchor="w")
         caixa = ttk.Frame(left)
         caixa.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(caixa, highlightthickness=0)
-        barra = ttk.Scrollbar(caixa, orient="vertical", command=self.canvas.yview)
-        self.lista_frame = ttk.Frame(self.canvas)
-        self.lista_frame.bind(
-            "<Configure>",
-            lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
-        )
-        self.canvas.create_window((0, 0), window=self.lista_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=barra.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
+        self.lista = tk.Listbox(caixa, selectmode="extended", exportselection=False, activestyle="dotbox")
+        barra = ttk.Scrollbar(caixa, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=barra.set)
+        self.lista.pack(side="left", fill="both", expand=True)
         barra.pack(side="right", fill="y")
         botoes = ttk.Frame(left)
         botoes.pack(fill="x", pady=6)
         for texto, comando in (
+            ("Novo", self.novo),
             ("Importar", self.importar),
             ("Exportar", self.exportar),
             ("Apagar", self.apagar),
@@ -1489,11 +1443,7 @@ class App(tk.Tk):
         self.entrada_faixa.configure(state=estado)
         self.caixa_otimizar.configure(state=estado)
         self.caixa_melhorar.configure(state=estado)
-        for filho in self.lista_frame.winfo_children():
-            try:
-                filho.configure(state=estado)
-            except tk.TclError:
-                pass
+        self.lista.configure(state=estado)
 
     def pick_folder(self):
         path = filedialog.askdirectory(initialdir=self.folder.get() or "D:\\")
@@ -1506,30 +1456,48 @@ class App(tk.Tk):
             gravar_config(path, faixa, self.otimizar.get(), self.melhorar.get())
 
     def selecionados(self):
-        escolhidos = [nome for nome, var in self.marcas.items() if var.get()]
+        escolhidos = [self.lista.get(i) for i in self.lista.curselection()]
         if not escolhidos:
-            messagebox.showinfo("OsmTerreno", "Marque um ou mais OSM na lista.")
+            messagebox.showinfo("OsmTerreno", "Selecione um ou mais OSM na lista.")
             return []
         return [os.path.join(OSM_DIR, nome) for nome in escolhidos]
 
     def marcar_todos(self):
-        for var in self.marcas.values():
-            var.set(True)
+        self.lista.selection_set(0, "end")
 
     def desmarcar_todos(self):
-        for var in self.marcas.values():
-            var.set(False)
+        self.lista.selection_clear(0, "end")
 
     def recarregar(self, nome=None):
-        for filho in self.lista_frame.winfo_children():
-            filho.destroy()
-        self.marcas = {}
+        self.lista.delete(0, "end")
         os.makedirs(OSM_DIR, exist_ok=True)
         nomes = sorted(n for n in os.listdir(OSM_DIR) if n.lower().endswith(".osm"))
         for nome_arquivo in nomes:
-            var = tk.BooleanVar(value=nome_arquivo == nome)
-            self.marcas[nome_arquivo] = var
-            ttk.Checkbutton(self.lista_frame, text=nome_arquivo, variable=var).pack(anchor="w", fill="x")
+            self.lista.insert("end", nome_arquivo)
+        if nome in nomes:
+            indice = nomes.index(nome)
+            self.lista.selection_set(indice)
+            self.lista.see(indice)
+
+    def novo(self):
+        nome = simpledialog.askstring("OsmTerreno", "Nome do OSM novo:", parent=self)
+        if not nome:
+            return
+        nome = nome.strip()
+        if not nome.lower().endswith(".osm"):
+            nome += ".osm"
+        if any(c in nome for c in '\\/:*?"<>|'):
+            messagebox.showerror("OsmTerreno", "O nome tem um caractere que não pode ir no arquivo.")
+            return
+        destino = os.path.join(OSM_DIR, nome)
+        if os.path.exists(destino):
+            messagebox.showerror("OsmTerreno", "Já existe um OSM com esse nome.")
+            return
+        os.makedirs(OSM_DIR, exist_ok=True)
+        with open(destino, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write('<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" generator="OsmTerreno">\n</osm>\n')
+        self.recarregar(nome)
+        self.write("criado " + nome)
 
     def importar(self):
         path = filedialog.askopenfilename(
@@ -1647,6 +1615,15 @@ class App(tk.Tk):
         total = len(origens)
         self._mostrar_progresso(0, total, "Preparando…")
 
+        titulo = "Compilar" if func is aplicar else "Recuperar"
+        caminho_log = iniciar_log(titulo)
+        gravar_log("pasta " + folder)
+        gravar_log("faixa %.0f  otimizar %s  melhorar %s" % (faixa, otimizar, melhorar))
+
+        def registrar(linha):
+            gravar_log(linha)
+            self.write(linha)
+
         def andamento(feito, quantos):
             texto = "Tiles prontos: %d de %d" % (feito, quantos)
             self.after(0, lambda: self._mostrar_progresso(feito, quantos, texto))
@@ -1654,18 +1631,24 @@ class App(tk.Tk):
         def trabalho():
             nonlocal total
             try:
+                registrar("log em " + caminho_log)
                 if func is aplicar:
                     opcoes = {"faixa": faixa, "otimizar": otimizar, "melhorar": melhorar}
-                    total = compilar_varios(folder, origens, self.write, opcoes, andamento)
+                    total = compilar_varios(folder, origens, registrar, opcoes, andamento)
                 else:
-                    total = recuperar_varios(folder, origens, self.write, andamento)
+                    total = recuperar_varios(folder, origens, registrar, andamento)
+                gravar_log("concluido")
             except Cancelado:
-                pass
+                gravar_log("cancelado")
             except Exception as exc:
+                gravar_log("ERRO\n" + traceback.format_exc())
                 if not self.fechando:
                     self.after(0, lambda exc=exc: self.write("erro: " + str(exc)))
+                    self.after(0, lambda exc=exc: self.write("detalhe em " + caminho_log))
                     self.after(0, lambda exc=exc: self.status.set("Falhou: " + str(exc)))
-                    self.after(0, lambda exc=exc: messagebox.showerror("OsmTerreno", str(exc)))
+                    self.after(0, lambda exc=exc: messagebox.showerror(
+                        "OsmTerreno", str(exc) + "\n\nDetalhe em:\n" + caminho_log
+                    ))
             else:
                 if not self.fechando and not cancelar.is_set():
                     self.after(0, lambda: self._mostrar_progresso(total, total, "Concluído"))
