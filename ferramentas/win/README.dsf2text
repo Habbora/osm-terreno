@@ -1,0 +1,314 @@
+DSFTool Instructions and Release Notes
+
+Version History
+
+ 12/13/04 - Alpha 1    Initial release.
+ 12/20/04 - Alpha 2    Fixed file-close bug.
+  1/12/05 - Alpha 3    Fixed crash bug!
+  1/23/05 - Alpha 4    Added pipe support.
+ 12/19/05 - 1.0.1      Fixed support for global DSFs. (Change to polygon 
+                       command to support arbitrary coord depth)
+                       Allowed spaces in DEF filenames.
+                       Mach-O native Mac Grinder
+  1/05/06 - 1.1        Added ENV->Overlay Conversion
+                       Fixed crashes and hung files on Windows
+                       Fixed return codes for command-line tool
+                       Changed output for clean piping
+  7/24/06 - 1.1.1      Fixed support for bezier polygon parsing
+  2/13/07 - 1.2        Support for bezier curves with ST coordinates.
+                       Command line options can take one or two dashes.
+                       Tool can show version.
+                       Total capacity for polygons increased a lot.
+  3/11/08 - 1.3        Support for XGrinder automation.
+  1/25/08 - 1.4        Elevation in the DSF is scaled to improve precision vertically.
+                       Raw triangles will be optimized into strips - simply dump
+                       an arbitrary number of raw triangles - DSF2Text will form strips
+                       and break up groups of tris that are too numerous.
+                       Vector roads are not reversed as part of optimization - this helps traffic flow.
+                       DSF2Text will recognize the ST coordinates for draped polygons.
+                       Precision increased to 9 digits.
+  2/18/12 - 2.0        Support for raster data for X-Plane 10
+  3/30/15 - 2.0.1      Added error message that the file might be 7-zipped.
+                       Fixed decode of MSL-base objects.
+  3/19/19 - 2.1 b1     ENV support removed
+                       Fixes handling of 7-plane vertices.
+                       64 bit binaries on all platforms.
+  9/20/20 - 2.2 b1     Added support for AGL-base objects.
+                       Capable of directly reading 7z compressed DSF files.
+  4/02/23 - 2.3 b1     Auto-detection of DIVISIONS when converting to text
+                       New keyword HEIGHTS to set scale/offset of terrain height point pools.
+  5/07/24 - 2.4 a1     Auto-detection of HEIGHTS for overlay sceneries
+
+-------------------------------------------------------------------------------
+OVERVIEW
+-------------------------------------------------------------------------------
+
+DSFTool is a utility that converts X-plane Distribution Scenery Format (DSF)
+files to a text format and back again.
+
+WARNING: Working with DSF files as text DSFTool is intended primarily for
+programmers who want to create DSF files.
+
+-------------------------------------------------------------------------------
+SYSTEM REQUIREMENTS AND INSTALLATION
+-------------------------------------------------------------------------------
+
+DSFTool is provided for Windows, Linux and MacOS. To use DSFTool with XGrinder,
+make sure it is in a subdirectory 'tools' relative to the location of XGrinder.
+
+-------------------------------------------------------------------------------
+USING DSFTool
+-------------------------------------------------------------------------------
+
+DSFTool can be used via the command-line or in conjunction with XGrinder.  To
+use DSFTool with XGrinder, simply drag a .txt or .dsf file into the
+XGrinder window.
+
+WARNING: If DSF crashes, check your line endings!  I have had reports that
+TextEdit on the Mac ruines line endings.
+
+SUFFIX			CONVERSION
+TXT				Text -> DSF*
+DSF				DSF* -> Text
+
+* DSFs can be converted to text and back for full or overlay DSFs.
+
+WARNING: DSFTool is slow, especially when converting text back to a DSF file.
+Conversion can take ten minutes or more.  DSFTool will be unresponsive while
+it is working, but you should see elevated CPU usage.
+
+The syntax for the command line version is:
+
+DSFTool --dsf2text <input dsf> [<input dsf>] <output text>
+
+to convert from DSF to text and
+
+DSFTool --text2dsf <text file> <dsf file>
+
+to convert the other way.
+
+For <text file> you can specify a single dash (-)
+to read from stdin/stdout instead of a text file.  This allows for piped usage
+of DSFTool, e.g. 
+
+cat file.txt | ./DSFTool -text2dsf - output.dsf
+./DSFTool -DSFTool foo.dsf - | grep OBJECT_DEF | wc -l
+
+Piping is not available for DSF output files.  When converting to a binary
+file, status messages are sent to stdout and error messages to stderr.  When
+converting to text, all messages are sent to stderr so that piped output is
+strictly the DSF contents.  The result code indicates a successful conversion.
+
+See below to merge two DSF files.
+
+-------------------------------------------------------------------------------
+DSFTool FILE FORMAT
+-------------------------------------------------------------------------------
+
+The DSFTool file format starts out with a typical X-Plane header:
+
+A
+800    [<arbitrary text, e.g. name and version of tool creating the file>]
+DSF2TEXT
+
+It then consists of a series of commands, each one taking up one line.  In this
+reference, properties in <inequality signs> are to be filled in with real 
+values in the file.
+
+The DSFTool file format is not an exact replication of DSF - some of the 
+complexities of point pools and other compression schemes are omitted.  However
+the basic notion of indexed building block definitions, patches, etc. are all
+preserved, so it may help to read the DSF spec before trying to understand
+this format.
+
+WARNING: certain properties must come first - see the PROPERTY command below.
+
+(Hint: the easiest way to get a feel for the file format is to take a DSF file, 
+convert it to text and look through it.)  The file format is:
+
+# [<arbitrary text>]
+
+	All lines starting with unknown keywords are silently ignored. No current 
+	or future keywords will start with #, making this safe to use for comments.
+
+DIVISIONS <number>
+
+	This is a meta-command that instructs DSFTool to use a certain number of 
+	point pools to allocate points.  More pools generally means more accuracy
+	in storage, but may also increase file size if improperly used. 
+	If omitted, the default is 8 divisons, resulting in sixteen
+	point pools, 2^-19 deg or ~4"/20cm lateral resolution for coordinates.
+
+HEIGHTS <scale> <minimum>
+
+	This is a meta-command that instructs DSFTool to change scales and offsets
+	assigned to height data in all PATCH_VERTEX point pools.
+	If omitted, the defaults are 1.0 -32758.0, i.e. a resolution of 1.0m and
+	a maximum encodeable height of 1.0 * 65535 + -32768.0 = +32767.0m
+
+PROPERTY <name> <value>
+
+	This adds a "property" to the DSF file.  Properties are key-value pairs 
+	that specify various header information.  See the DSF file format spec for
+	useful property values.
+	
+-------------------------------------------------------------------------
+IMPORTANT: for pipelined input only, the DIVISIONS, HEIGHTS and PROPERTY
+  commands MUST come before all other commands. 
+  For all input types, the sim/[east|west|north|south] commands MUST come
+  last, after all other DIVISION, HEIGHTS and PROPERTY commands.
+-------------------------------------------------------------------------
+	
+TERRAIN_DEF <file name>
+OBJECT_DEF <file name>
+POLYGON_DEF <filename>
+NETWORK_DEF <filename>
+RASTER_DEF <filename>
+
+	These commands define a new type of building block.  Order is significant:
+	the first building block of each type has index zero and they then count
+	upward sequentially.  File extensions must be included.  The entire line
+	is utilized, so you may have whitespace in your filenames, although it
+	is not recommended. These comands are mandatory if related commands are
+	used, TERRAIN_DEF is mandatory if BEGIN_PATCH is used and etc.
+
+BEGIN_PATCH <primitive type> <near LOD> <far LOD> <flags> <# point coords>
+
+	This command begins a new terrain patch. Terrain definition index is
+	number of terrain definition to use on patch, starting from 0. The LOD
+	range is the distance it is visible - use 0..-1 to make it be always
+	visible.  The flag values are:
+
+	       1 - This patch should be used in the physics/collision engine.
+	       2 - This patch is an overlay and should be Z-buffer-offset.
+
+	These flags correspond to the patch flags in the DSF spec.  You also
+	specify the number of coordinates used in vertices for the patch.  At
+	least 5 coordinates are required for X-Plane: longitude, latitude,
+	elevation, and two normal coordinates.
+
+BEGIN_PRIMITIVE <type>
+
+	This begins a single primitive.  Types correspond to the DSF/spec and the
+	usual OpenGL definitions, and are:
+	
+		0 - Triangles
+		1 - Triangle Strip
+		2 - Triangle Fan
+
+PATCH_VERTEX [<coordinates>...]
+
+	This specifies one vertex within a primitive within a patch.  See the DSF
+	spec and terrain file format spec for information on how this information
+	is interpretted.  Generally the first five values are longitude and 
+	latitude in degrees, elevation in meters, and the X and Z coordinates of
+	the point's normal vector as a fraction (where +X = east, and +Z = south).
+	
+END_PRIMITIVE
+END_PATCH
+
+	These end the primitive and patch in progress, respectively.
+
+OBJECT <type> <longitude> <latitude> <rotation>
+
+	This adds an object to the file of a given type.  The position is 
+	specified in degrees and the angle is in degrees as well.
+
+OBJECT_AGL <type> <longitude> <latitude> <rotation> <elevation>
+OBJECT_MSL <type> <longitude> <latitude> <rotation> <elevation>
+
+	These are extensions of the OBJECT command to specify the object
+	to be at an specific elevation rather than at the terrain ground level
+
+BEGIN_SEGMENT <type> <subtype> <node id> <longitude> <latitude> <elevation>
+BEGIN_SEGMENT_CURVED <type> <subtype> <node id> 
+	<longitude> <latitude> <elevation> <longitude> <latitude> <elevation>
+	
+	These start a new vector segment.  Type should be 0 for X-Plane and 
+	subtype specifies the road type.  See the DSF spec for a discussion of
+	node IDs - these unique numbers identify each vertex.  The position is
+	specified in latitude and longitude degrees and meters MSL.  For the
+	curved variant, a second point specifies a "control handle" for bezier-
+	curve-type curving of the road.
+	
+SHAPE_POINT <longitude> <latitude> <elevation>
+SHAPE_POINT_CURVED <longitude> <latitude> <elevation> <longitude> 
+	<latitude> <elevation>
+
+	A shape point defines a turn in the vector road without an intersection.
+
+END_SEGMENT <node id> <longitude> <latitude> <elevation>
+END_SEGMENT_CURVED <node id> <longitude> <latitude> <elevation> <longitude> 
+	<latitude> <elevation>
+	
+	These end a vector segment, with similar parameters to the above commands.
+
+BEGIN_POLYGON <type> <param> [<coords>]
+
+	This begins a polygon primitive, which is usually a facade in X-Plane.
+	The parameter's meaning depends on the primitive - for facades it is the
+	height in meters.  If coords is specified any number of points can
+	follow in the poylgon_point command, otherwise they must be lon/lat.
+
+BEGIN_WINDING
+
+	This indicates the beginning of a winding, or single polygon within
+	a nested polygon.  This command is mandatory even if the polygon is
+	not nested.
+	
+POLYGON_POINT <longitude> <latitude> [<more coords>]
+
+	This adds a point to the polygon.
+	
+END_WINDING
+END_POLYGON
+
+	This ends the winding and polygon respectively.
+
+RASTER_DATA version=<version> bbp=<bpp> flags=<flags> width=<wdith> height=<hegiht> scale=<scale> offset=<offset> filename
+
+	This indicates a raster layer; the properties must be in this order and
+	match the DSF raster layer info atom.  The filename is the name of a binary
+	file that contains the raw data to include (or is output).
+
+FILTER <index>
+
+	This sets up automatic exclusion functionality. Content after a FILTER
+	command is only displayed if the same scenery includes an active apt.dat
+	entry with a matching AirportID.
+	The airportID's are specified with sim/filter/aptid <AirportID>	properties,
+	the index in the FILTER command refers to the n-th property of this type.
+	If that airport is inactive due to being superceeded by another airport of 
+	the same AirportID in another airport, all content after this until the 
+	next FILTER command or end-of-file is skipped when loading the DSF.
+
+-------------------------------------------------------------------------------
+MERGING TWO DSF FILES
+-------------------------------------------------------------------------------
+
+DSFTool can help you merge the contents of two DSF files.  When you send
+multiple DSF files to text using --dsf2text mode, DSFTool will offset the
+indices for art assets in subsequent files so that they can be rewritten into
+a single file.  
+
+For example, consider two DSF overlays A and B.  Each one contains one object
+(A.obj and B.obj).  When you convert them both to text simultaneously, you will
+get this output:
+
+# A.dsf
+OBJECT_DEF A.obj
+OBJECT 0 <location of object A>
+# B.dsf
+OBJECT_DEF B.obj
+OBJECT 1 <location of object B>
+
+Object B now has index 1 (not 0) because it is the 2nd object among _all_ files.
+
+Once you have this output, to produce a merged DSF, simply consolidate all
+properties to the header of the file.  (Each DSF will come with its own properties
+so you will have a number of duplicates.)
+
+TIP: the sim/require_obj property forces objects of a certain index _and higher_
+to be loaded all of the time.  When merging a DSF with autogen-type objects with
+a DSF with custom scenery, list the custom scenery second, so the highest priority
+objects will have the highest index numbers in the final file.

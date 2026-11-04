@@ -412,13 +412,40 @@ class Handler(SimpleHTTPRequestHandler):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
 
 
+_httpd = None
+
+
+def garantir_servidor():
+    """Sobe o editor neste processo, sem abrir o navegador. Devolve a URL."""
+    global _httpd
+    cfg = load_config()
+    patches = OSM_DIR if OSM_DIR.is_dir() else detect_patches_dir(cfg)
+    cfg["patches_dir"] = str(patches)
+    save_config(cfg)
+    url = "http://127.0.0.1:%s/editor.html" % PORT
+    if _httpd is not None:
+        return url
+    try:
+        _httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        return url
+    threading.Thread(target=_httpd.serve_forever, daemon=True).start()
+    return url
+
+
 if __name__ == "__main__":
     cfg = load_config()
     patches = detect_patches_dir(cfg)
     cfg["patches_dir"] = str(patches)
     save_config(cfg)
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = "http://127.0.0.1:%s/editor.html" % PORT
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as exc:
+        print("A interface já está aberta em %s" % url, flush=True)
+        print(exc, flush=True)
+        webbrowser.open(url)
+        raise SystemExit(0)
     print("Editor OSM: %s" % url, flush=True)
     print("Patches:    %s" % patches, flush=True)
     if patches.resolve() == APP_ROOT.resolve():

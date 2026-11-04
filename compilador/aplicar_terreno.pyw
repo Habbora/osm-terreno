@@ -4,15 +4,20 @@ A grade original tem cerca de 90 m e nao acompanha o contorno do aeroporto.
 O programa refina essa grade e pinta cada celula que o poligono do OSM toca.
 """
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import shutil
 import socket
+import sys
 import struct
 import subprocess
 import tempfile
 import threading
+import time
+import multiprocessing
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 import tkinter as tk
 import webbrowser
 import xml.etree.ElementTree as ET
@@ -20,25 +25,100 @@ from math import cos, hypot, radians, tanh
 from tkinter import filedialog, messagebox, ttk
 
 import numpy
-from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, box
-from shapely.ops import triangulate, unary_union
+import triangle
+from collections import defaultdict
+
+from shapely.geometry import GeometryCollection, LineString, MultiPoint, MultiPolygon, Point, Polygon, box
+from shapely import constrained_delaunay_triangles, get_coordinates
+from shapely.ops import polygonize, snap, unary_union
 from shapely.prepared import prep
+from shapely.strtree import STRtree
 
 M_LAT = 110540.0
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+cancelar = threading.Event()
+_proc_trava = threading.Lock()
+_proc_atual = None
+_evento_processos = None
+_checagens = 0
+_triangle_trava = threading.Lock()
+
+
+class Cancelado(Exception):
+    pass
+
+
+def verificar_cancelamento():
+    """Chamada dentro dos laços. Só consulta o aviso a cada 500 vezes, porque entre processos ele custa caro."""
+    global _checagens
+    _checagens += 1
+    if _checagens % 500 == 0 and cancelar.is_set():
+        raise Cancelado()
+
+
+def pedir_cancelamento():
+    cancelar.set()
+    if _evento_processos is not None:
+        _evento_processos.set()
+    with _proc_trava:
+        proc = _proc_atual
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+
+
+def run_quiet(args, cwd=None):
+    if cancelar.is_set():
+        raise Cancelado()
+    kwargs = {"cwd": cwd, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        info = subprocess.STARTUPINFO()
+        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = info
+        kwargs["creationflags"] = NO_WINDOW | subprocess.DETACHED_PROCESS
+    proc = subprocess.Popen(args, **kwargs)
+    global _proc_atual
+    with _proc_trava:
+        _proc_atual = proc
+    try:
+        while True:
+            try:
+                code = proc.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancelar.is_set():
+                    proc.kill()
+                    proc.wait()
+                    raise Cancelado()
+    finally:
+        with _proc_trava:
+            if _proc_atual is proc:
+                _proc_atual = None
+    if cancelar.is_set():
+        raise Cancelado()
+    if code != 0:
+        raise subprocess.CalledProcessError(code, args)
 
 
 def seven_zip():
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, "7z.exe"),
-        r"C:\Program Files\7-Zip\7z.exe",
-        r"C:\Program Files (x86)\7-Zip\7z.exe",
-        r"C:\Users\aliss\Downloads\Ortho4XP-master\Ortho4XP-master\Utils\win\7z.exe",
+    nome = "7z.exe" if os.name == "nt" else "7z"
+    pasta = "win" if os.name == "nt" else "lin"
+    candidatos = [
+        os.path.join(here, "..", "ferramentas", pasta, nome),
+        os.path.join(here, nome),
+        shutil.which(nome) or "",
+        shutil.which("7zz") or "",
     ]
-    for path in candidates:
-        if os.path.isfile(path):
+    if os.name == "nt":
+        candidatos += [
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe",
+        ]
+    for path in candidatos:
+        if path and os.path.isfile(path):
             return path
-    raise FileNotFoundError("7z.exe nao encontrado")
+    raise FileNotFoundError("7z nao encontrado. Instale o 7-Zip.")
 
 
 def dist_m(a, b, m_lon):
@@ -147,136 +227,6 @@ def read_props(data):
     return props
 
 
-def elevation_span(data):
-    off = 12
-    end = len(data) - 16
-    while off + 8 <= end:
-        aid = data[off : off + 4][::-1].decode("ascii", "replace")
-        length = struct.unpack_from("<I", data, off + 4)[0]
-        if aid == "DEMS":
-            sub = off + 8
-            stop = off + length
-            pending = None
-            while sub + 8 <= stop:
-                sid = data[sub : sub + 4][::-1].decode("ascii", "replace")
-                slen = struct.unpack_from("<I", data, sub + 4)[0]
-                if sid == "DEMI":
-                    info = data[sub + 8 : sub + slen]
-                    width, height = struct.unpack_from("<II", info, 4)
-                    scale, offset = struct.unpack_from("<ff", info, 12)
-                    pending = (width, height, scale, offset)
-                elif sid == "DEMD" and pending and slen - 8 == pending[0] * pending[1] * 2:
-                    width, height, scale, offset = pending
-                    return sub + 8, width, height, scale, offset
-                sub += slen
-        if length < 8:
-            break
-        off += length
-    return None
-
-
-FINE = 4801
-
-
-def upsample(grid, fine):
-    """Stretch the degree raster so a cell is about 23 m, close to the mesh."""
-    height, width = grid.shape
-    rows = numpy.linspace(0, height - 1, fine)
-    cols = numpy.linspace(0, width - 1, fine)
-    r0 = numpy.floor(rows).astype(numpy.int32)
-    c0 = numpy.floor(cols).astype(numpy.int32)
-    r1 = numpy.minimum(r0 + 1, height - 1)
-    c1 = numpy.minimum(c0 + 1, width - 1)
-    fr = (rows - r0)[:, None]
-    fc = (cols - c0)[None, :]
-    src = grid.astype(numpy.float32)
-    mixed = (
-        src[r0][:, c0] * (1 - fr) * (1 - fc)
-        + src[r0][:, c1] * (1 - fr) * fc
-        + src[r1][:, c0] * fr * (1 - fc)
-        + src[r1][:, c1] * fr * fc
-    )
-    return numpy.rint(mixed).astype(numpy.int16)
-
-
-def paint(grid, west, south, width, height, scale, offset, flats, ramps):
-    """Fill every cell the OSM polygon touches, so the airport keeps that outline."""
-    m_lon = 111320.0 * cos(radians(south + 0.5))
-    dlat = 1.0 / (height - 1)
-    dlon = 1.0 / (width - 1)
-    touched = numpy.zeros(grid.shape, dtype=bool)
-    layers = [(poly, ("flat", alt)) for poly, alt in flats]
-    layers += [(poly, ("ramp", h0, h1, l0, l1, high, low, profile)) for poly, h0, h1, l0, l1, high, low, profile in ramps]
-    for polygon, spec in layers:
-        minx, miny, maxx, maxy = polygon.bounds
-        c0 = max(0, int((minx - west) / dlon) - 1)
-        c1 = min(width - 1, int((maxx - west) / dlon) + 1)
-        r0 = max(0, int((miny - south) / dlat) - 1)
-        r1 = min(height - 1, int((maxy - south) / dlat) + 1)
-        for row in range(r0, r1 + 1):
-            lat0 = south + row * dlat
-            for col in range(c0, c1 + 1):
-                lon0 = west + col * dlon
-                cell = box(lon0, lat0, lon0 + dlon, lat0 + dlat)
-                if not polygon.intersects(cell):
-                    continue
-                lon = lon0 + dlon * 0.5
-                lat = lat0 + dlat * 0.5
-                if spec[0] == "flat":
-                    height_m = spec[1]
-                else:
-                    _, h0, h1, l0, l1, high, low, profile = spec
-                    d_high = segment_distance((lon, lat), h0, h1, m_lon)
-                    d_low = segment_distance((lon, lat), l0, l1, m_lon)
-                    span = d_high + d_low
-                    t = 0.0 if span == 0 else d_high / span
-                    height_m = high - profile(t) * (high - low)
-                raw = int(round((height_m - offset) / scale))
-                grid[row, col] = max(-32768, min(32767, raw))
-                touched[row, col] = True
-    return int(touched.sum())
-
-
-def replace_elevation(data, grid, scale, offset):
-    """Swap the first elevation raster. The new grid can be a different size."""
-    height, width = grid.shape
-    off = 12
-    end = len(data) - 16
-    while off + 8 <= end:
-        length = struct.unpack_from("<I", data, off + 4)[0]
-        aid = data[off : off + 4][::-1].decode("ascii", "replace")
-        if aid == "DEMS":
-            sub = off + 8
-            stop = off + length
-            demi_at = None
-            info = None
-            while sub + 8 <= stop:
-                sid = data[sub : sub + 4][::-1].decode("ascii", "replace")
-                slen = struct.unpack_from("<I", data, sub + 4)[0]
-                if sid == "DEMI":
-                    demi_at = sub
-                    info = bytes(data[sub + 8 : sub + slen])
-                elif sid == "DEMD" and demi_at is not None and info is not None:
-                    head = info[:4] + struct.pack("<IIff", width, height, float(scale), float(offset))
-                    demi = b"IMED" + struct.pack("<I", 8 + len(head)) + head
-                    payload = numpy.ascontiguousarray(grid, dtype="<i2").tobytes()
-                    demd = b"DMED" + struct.pack("<I", 8 + len(payload)) + payload
-                    blob = demi + demd
-                    local = demi_at - off
-                    dems = bytearray(data[off : off + length])
-                    dems[local : sub + slen - off] = blob
-                    struct.pack_into("<I", dems, 4, len(dems))
-                    out = bytearray(data[:off] + dems + data[off + length : -16])
-                    out += b"\x00" * 16
-                    out[-16:] = hashlib.md5(out[:-16]).digest()
-                    return out
-                sub += slen
-        if length < 8:
-            break
-        off += length
-    raise RuntimeError("grade de altitude nao encontrada")
-
-
 def load_dsf(path, work):
     with open(path, "rb") as handle:
         magic = handle.read(2)
@@ -284,10 +234,7 @@ def load_dsf(path, work):
     if os.path.isfile(raw):
         os.remove(raw)
     if magic == b"7z":
-        subprocess.check_call(
-            [seven_zip(), "e", "-y", "-o" + work, path],
-            stdout=subprocess.DEVNULL,
-        )
+        run_quiet([seven_zip(), "e", "-y", "-o" + work, path])
         wanted = os.path.basename(path)
         if wanted.endswith(".antes_osm"):
             wanted = wanted[: -len(".antes_osm")]
@@ -313,92 +260,38 @@ def store_dsf(src_raw, dest, compressed):
     archive = dest + ".tmp.7z"
     if os.path.isfile(archive):
         os.remove(archive)
-    subprocess.check_call(
+    run_quiet(
         [seven_zip(), "a", "-t7z", "-m0=LZMA", "-mx=5", "-md=48m", archive, "--", os.path.basename(src_raw)],
         cwd=folder,
-        stdout=subprocess.DEVNULL,
     )
     os.replace(archive, dest)
 
 
-def edit_file(path, flats, ramps, log):
-    lat, lon = tile_of(path)
-    tile = box(lon, lat, lon + 1, lat + 1)
-    hit = any(poly.intersects(tile) for poly, _ in flats) or any(
-        poly.intersects(tile) for poly, *_ in ramps
-    )
-    if not hit:
-        return 0
-    backup = path + ".antes_osm"
-    work = tempfile.mkdtemp(prefix="xpme_")
-    try:
-        if not os.path.isfile(backup):
-            shutil.copy2(path, backup)
-            log("backup " + backup)
-        raw, compressed = load_dsf(backup, work)
-        if compressed:
-            raw = os.path.join(work, os.path.basename(path))
-        data = bytearray(open(raw, "rb").read())
-        span = elevation_span(data)
-        if span is None:
-            log("sem grade de altitude, ignorado: " + os.path.basename(os.path.dirname(os.path.dirname(path))))
-            return 0
-        at, width, height, scale, offset = span
-        props = read_props(data)
-        west = float(props.get("sim/west", lon))
-        south = float(props.get("sim/south", lat))
-        coarse = numpy.frombuffer(data, dtype="<i2", count=width * height, offset=at).reshape(height, width).copy()
-        grid = upsample(coarse, FINE)
-        painted = paint(grid, west, south, FINE, FINE, scale, offset, flats, ramps)
-        data = replace_elevation(data, grid, scale, offset)
-        open(raw, "wb").write(data)
-        store_dsf(raw, path, compressed)
-        log("%s  grade %d  pixels do aeroporto %d" % (os.path.basename(path), FINE, painted))
-        return painted
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def aplicar(folder, osm, log):
-    flats, ramps, bounds = load_patch(osm)
-    log("poligonos planos %d, rampas %d" % (len(flats), len(ramps)))
-    dsfs = find_dsfs(folder)
-    south = [path for path in dsfs if "XPME_South_America" in path]
-    if south:
-        dsfs = south
-    if not dsfs:
-        raise RuntimeError("nenhum DSF nessa pasta")
-    total = 0
-    used = 0
-    for path in dsfs:
-        painted = edit_file(path, flats, ramps, log)
-        if painted:
-            used += 1
-            total += painted
-    if not used:
-        raise RuntimeError("nenhum DSF cobre a area do OSM")
+def layers_of(flats, ramps):
     layers = [(poly, ("flat", alt)) for poly, alt in flats]
     layers += [
         (poly, ("ramp", h0, h1, l0, l1, high, low, profile))
         for poly, h0, h1, l0, l1, high, low, profile in ramps
     ]
-    for path in dsfs:
-        lat, lon = tile_of(path)
-        tile = box(lon, lat, lon + 1, lat + 1)
-        if any(poly.intersects(tile) for poly, _spec in layers):
-            recortar_dsf(path, layers, log)
-    log("pronto: %d pixels em %d arquivo(s)" % (total, used))
-    return total
+    return layers
 
 
 def dsf_tool():
-    path = r"C:\Users\aliss\Downloads\Ortho4XP-master\Ortho4XP-master\Utils\win\DSFTool.exe"
+    here = os.path.dirname(os.path.abspath(__file__))
+    if sys.platform == "darwin":
+        pasta, nome = "mac", "DSFTool"
+    elif sys.platform.startswith("linux"):
+        pasta, nome = "lin", "DSFTool"
+    else:
+        pasta, nome = "win", "DSFTool.exe"
+    path = os.path.normpath(os.path.join(here, "..", "ferramentas", pasta, "tools", nome))
     if not os.path.isfile(path):
-        raise FileNotFoundError("DSFTool.exe nao encontrado")
+        raise FileNotFoundError("DSFTool nao encontrado em ferramentas/%s/tools" % pasta)
     return path
 
 
 BLEND_M = 70.0
+SEA_M = 0.0
 
 
 def spec_height(lon, lat, spec, m_lon):
@@ -423,11 +316,17 @@ def altitude_at(lon, lat, layers, m_lon):
     return height_m
 
 
-def height_on_mesh(lon, lat, layers, m_lon, dem_z):
-    """Dentro do polígono usa o OSM. Na faixa de 70 m desce liso até o terreno."""
+def height_on_mesh(lon, lat, layers, m_lon, dem_z, proteger_agua=True, blend_m=BLEND_M):
+    """Dentro do polígono usa o OSM. Na faixa escolhida desce liso até o terreno.
+
+    Dentro do polígono a altitude do OSM vale mesmo abaixo do mar.
+    Fora dele, o mar fica com a malha original.
+    """
     inside = altitude_at(lon, lat, layers, m_lon)
     if inside is not None:
         return inside
+    if proteger_agua and dem_z <= SEA_M:
+        return None
     point = Point(lon, lat)
     nearest = None
     nearest_m = None
@@ -436,11 +335,11 @@ def height_on_mesh(lon, lat, layers, m_lon, dem_z):
         if nearest_m is None or dist_m < nearest_m:
             nearest_m = dist_m
             nearest = (polygon, spec)
-    if nearest is None or nearest_m is None or nearest_m >= BLEND_M:
+    if nearest is None or nearest_m is None or blend_m <= 0 or nearest_m >= blend_m:
         return dem_z
     border = nearest[0].exterior.interpolate(nearest[0].exterior.project(point))
     edge_z = spec_height(border.x, border.y, nearest[1], m_lon)
-    t = nearest_m / BLEND_M
+    t = nearest_m / blend_m
     t = t * t * (3.0 - 2.0 * t)
     return edge_z * (1.0 - t) + dem_z * t
 
@@ -488,18 +387,15 @@ def surface_parts(geom):
             yield from surface_parts(part)
 
 
-def clip_polygons(layers, m_lon):
-    pad = BLEND_M / 111320.0
-    clips = []
-    for polygon, _spec in layers:
-        clips.append(polygon)
-        skirt = polygon.buffer(pad)
-        if not skirt.is_empty:
-            clips.append(skirt)
+def clip_polygons(layers, region):
+    """Contorno de cada polígono e uma única borda externa da faixa."""
+    clips = [polygon for polygon, _spec in layers]
+    if not region.is_empty:
+        clips.append(region)
     return clips
 
 
-def cut_triangle(verts, clips, region):
+def cut_triangle(verts, clips, region, quality=False):
     """Divide um triângulo nas bordas do OSM. Cada vértice é (lon, lat, extras)."""
     corners = [(v[0], v[1]) for v in verts]
     if corners[0] == corners[1] or corners[1] == corners[2] or corners[0] == corners[2]:
@@ -509,6 +405,13 @@ def cut_triangle(verts, clips, region):
         tri = tri.buffer(0)
     if tri.is_empty or not region.intersects(tri):
         return [verts]
+    touch = []
+    for polygon in clips:
+        if polygon.intersects(tri):
+            touch.extend(get_coordinates(tri.exterior.intersection(polygon.boundary)).tolist())
+    extra = [p for p in touch if min(hypot(p[0] - c[0], p[1] - c[1]) for c in corners) > 1e-11]
+    if extra:
+        tri = snap(tri, MultiPoint(extra), 1e-11)
     pieces = [tri]
     for polygon in clips:
         nxt = []
@@ -519,11 +422,14 @@ def cut_triangle(verts, clips, region):
             nxt.extend(surface_parts(piece.intersection(polygon)))
             nxt.extend(surface_parts(piece.difference(polygon)))
         pieces = nxt
+    if not extra and len(pieces) == 1 and abs(pieces[0].area - tri.area) <= tri.area * 1e-9:
+        return [verts]
     origin = signed_area(corners[0], corners[1], corners[2])
     made = []
     for piece in pieces:
-        for small in triangulate(piece):
-            if small.area <= 1e-14 or not piece.buffer(1e-12).covers(small.centroid):
+        smalls = triangulate_face(piece) if quality else surface_parts(constrained_delaunay_triangles(piece))
+        for small in smalls:
+            if small.area <= 1e-16:
                 continue
             ring = list(small.exterior.coords)[:3]
             if origin * signed_area(ring[0], ring[1], ring[2]) < 0:
@@ -551,84 +457,420 @@ def format_vertex(vertex, z_value):
     return "PATCH_VERTEX %.9f %.9f %.3f %s\n" % (lon, lat, z_value, tail)
 
 
-def cut_mesh_text(src, dst, layers, grid, west, south, log):
-    region = unary_union([polygon for polygon, _spec in layers]).buffer(BLEND_M / 111320.0)
-    minx, miny, maxx, maxy = region.bounds
-    m_lon = 111320.0 * cos(radians((miny + maxy) * 0.5))
-    clips = clip_polygons(layers, m_lon)
-    pad = 0.002
-    kept = 0
-    cut = 0
-    with open(src, "r", encoding="utf-8", errors="ignore") as fin, open(dst, "w", encoding="utf-8", newline="\n") as fout:
-        primitive = False
-        batch = []
+def vertex_key(vertex):
+    return (round(vertex[0], 8), round(vertex[1], 8))
+
+
+def edge_key(a, b):
+    ka = vertex_key(a)
+    kb = vertex_key(b)
+    return (ka, kb) if ka <= kb else (kb, ka)
+
+
+def read_batches(src):
+    """Gera (linha, lote) para cada linha do texto do DSF. O lote vem no END_PRIMITIVE."""
+    primitive = False
+    batch = []
+    with open(src, "r", encoding="utf-8", errors="ignore") as fin:
         for line in fin:
             if line.startswith("BEGIN_PRIMITIVE"):
                 primitive = True
                 batch = []
-                fout.write(line)
+                yield line, None
                 continue
             if line.startswith("END_PRIMITIVE"):
                 primitive = False
-                index = 0
-                while index + 2 < len(batch):
+                yield line, batch
+                continue
+            if primitive and line.startswith("PATCH_VERTEX"):
+                batch.append(tuple(float(item) for item in line.split()[1:]))
+                continue
+            yield line, None
+
+
+def flat_level(tri):
+    """Altura comum dos três vértices, em milímetros. None quando o triângulo inclina."""
+    z = tri[0][2]
+    if abs(tri[1][2] - z) > 1e-3 or abs(tri[2][2] - z) > 1e-3:
+        return None
+    return int(round(z * 1000.0))
+
+
+def merge_flat(tris):
+    """Junta os pedaços que estão na mesma altura. A borda de cada grupo fica igual."""
+    groups = defaultdict(list)
+    out = []
+    for tri in tris:
+        level = flat_level(tri)
+        if level is None:
+            out.append(tri)
+        else:
+            groups[level].append(tri)
+    for group in groups.values():
+        if len(group) < 3:
+            out.extend(group)
+            continue
+        out.extend(merge_group(group))
+    return out
+
+
+MIN_ANGLE = 25
+
+
+def cdt_parts(shape):
+    return list(surface_parts(constrained_delaunay_triangles(shape)))
+
+
+def quality_parts(face):
+    """Triangle (Shewchuk) sem ponto novo na borda e sem limite de tamanho. Só cria ponto no meio para evitar ângulo fechado."""
+    ox, oy = face.bounds[0], face.bounds[1]
+    m_lon = 111320.0 * cos(radians(oy))
+    vertices = []
+    segments = []
+    holes = []
+    for index, ring in enumerate([face.exterior, *face.interiors]):
+        coords = list(ring.coords)[:-1]
+        clean = []
+        for x, y in coords:
+            if not clean or (x, y) != clean[-1]:
+                clean.append((x, y))
+        if len(clean) > 1 and clean[0] == clean[-1]:
+            clean.pop()
+        if len(clean) < 3:
+            return None
+        start = len(vertices)
+        for x, y in clean:
+            vertices.append(((x - ox) * m_lon, (y - oy) * 111320.0))
+        for n in range(len(clean)):
+            segments.append((start + n, start + (n + 1) % len(clean)))
+        if index > 0:
+            inside = Polygon(ring).representative_point()
+            holes.append(((inside.x - ox) * m_lon, (inside.y - oy) * 111320.0))
+    data = {"vertices": vertices, "segments": segments}
+    if holes:
+        data["holes"] = holes
+    try:
+        with _triangle_trava:
+            result = triangle.triangulate(data, "pq%dYQ" % MIN_ANGLE)
+    except Exception:
+        return None
+    if "triangles" not in result:
+        return None
+    pts = [(ox + x / m_lon, oy + y / 111320.0) for x, y in result["vertices"]]
+    lookup = {
+        (round(x, 8), round(y, 8)): (x, y)
+        for ring in [face.exterior, *face.interiors]
+        for x, y in ring.coords
+    }
+    pts = [lookup.get((round(x, 8), round(y, 8)), (x, y)) for x, y in pts]
+    return [Polygon([pts[a], pts[b], pts[c]]) for a, b, c in result["triangles"]]
+
+
+def triangulate_face(face):
+    pieces = quality_parts(face)
+    if pieces:
+        total = sum(piece.area for piece in pieces)
+        if abs(total - face.area) <= face.area * 1e-6:
+            return pieces
+    return cdt_parts(face)
+
+
+def merge_group(group):
+    points = {}
+    counts = defaultdict(int)
+    for tri in group:
+        for vertex in tri:
+            points[vertex_key(vertex)] = vertex
+        for n in range(3):
+            counts[edge_key(tri[n], tri[(n + 1) % 3])] += 1
+    border = [LineString([a, b]) for (a, b), used in counts.items() if used == 1]
+    if not border:
+        return group
+    shapes = [Polygon([(v[0], v[1]) for v in tri]) for tri in group]
+    area = unary_union(shapes)
+    inside = prep(area.buffer(1e-10))
+    tree = STRtree(shapes)
+    sign = signed_area(group[0][0], group[0][1], group[0][2])
+    level = group[0][0][2]
+
+    def locate(x, y):
+        for index in tree.query(Point(x, y), predicate="intersects"):
+            base = group[int(index)]
+            made_vertex = interpolate_vertex((x, y), base)
+            return (made_vertex[0], made_vertex[1], level, *made_vertex[3:])
+        return None
+
+    made = []
+    for face in polygonize(unary_union(border)):
+        if face.area <= 0 or not inside.covers(face.representative_point()):
+            continue
+        for small in triangulate_face(face):
+            ring = list(small.exterior.coords)[:3]
+            keys = [(round(x, 8), round(y, 8)) for x, y in ring]
+            for key, (x, y) in zip(keys, ring):
+                if key not in points:
+                    found = locate(x, y)
+                    if found is None:
+                        return group
+                    points[key] = found
+            tri = [points[key] for key in keys]
+            if sign * signed_area(tri[0], tri[1], tri[2]) < 0:
+                tri = [tri[0], tri[2], tri[1]]
+            made.append(tuple(tri))
+    if not made:
+        return group
+    total = sum(abs(signed_area(t[0], t[1], t[2])) for t in made)
+    if abs(total - area.area * 2.0) > area.area * 2e-4:
+        return group
+    return made
+
+
+SNAP_M = 1.5
+
+
+def mesh_points_near(src, bounds, pad):
+    """Vértices da malha original dentro da caixa, sem repetir."""
+    minx, miny, maxx, maxy = bounds
+    seen = set()
+    for _line, batch in read_batches(src):
+        if batch is None:
+            continue
+        for vertex in batch:
+            if minx - pad <= vertex[0] <= maxx + pad and miny - pad <= vertex[1] <= maxy + pad:
+                seen.add((vertex[0], vertex[1]))
+    return list(seen)
+
+
+def snap_to_mesh(shape, tree, points, tol):
+    """Encaixa o contorno nos vértices da malha a até tol. Devolve o original se o encaixe estragar a forma."""
+    near = tree.query(shape.boundary.buffer(tol))
+    if len(near) == 0:
+        return shape
+    ref = MultiPoint([points[int(index)] for index in near])
+    moved = snap(shape, ref, tol)
+    if not moved.is_valid:
+        moved = moved.buffer(0)
+    if moved.is_empty or abs(moved.area - shape.area) > shape.area * 0.01:
+        return shape
+    return moved
+
+
+def snap_layers(src, layers, blend_m, log):
+    """Contornos dos polígonos e da faixa encaixados nos vértices da malha a até SNAP_M."""
+    tol = SNAP_M / 111320.0
+    union = unary_union([polygon for polygon, _spec in layers])
+    bounds = union.buffer(blend_m / 111320.0).bounds
+    points = mesh_points_near(src, bounds, 0.002)
+    if not points:
+        return layers, union.buffer(blend_m / 111320.0)
+    tree = STRtree([Point(p) for p in points])
+    snapped = [(snap_to_mesh(polygon, tree, points, tol), spec) for polygon, spec in layers]
+    region = unary_union([polygon for polygon, _spec in snapped]).buffer(blend_m / 111320.0)
+    region = snap_to_mesh(region, tree, points, tol)
+    log("contornos encaixados na malha (ate %.1f m)" % SNAP_M)
+    return snapped, region
+
+
+def cut_mesh_text(src, dst, layers, grid, west, south, log, proteger_agua=True, blend_m=BLEND_M, otimizar=False, melhorar=False):
+    if melhorar:
+        layers, region = snap_layers(src, layers, blend_m, log)
+    else:
+        region = unary_union([polygon for polygon, _spec in layers]).buffer(blend_m / 111320.0)
+    minx, miny, maxx, maxy = region.bounds
+    m_lon = 111320.0 * cos(radians((miny + maxy) * 0.5))
+    if melhorar:
+        clips = [polygon for polygon, _spec in layers]
+    else:
+        clips = clip_polygons(layers, region)
+    region_ready = prep(region)
+    airport_ready = prep(unary_union([polygon for polygon, _spec in layers]))
+    pad = 0.002
+
+    def decide(verts):
+        lons = [v[0] for v in verts]
+        lats = [v[1] for v in verts]
+        if (
+            max(lons) < minx - pad
+            or min(lons) > maxx + pad
+            or max(lats) < miny - pad
+            or min(lats) > maxy + pad
+        ):
+            return None
+        tri = Polygon([(v[0], v[1]) for v in verts])
+        if tri.is_empty or not region_ready.intersects(tri):
+            return False
+        if proteger_agua and not airport_ready.intersects(tri):
+            if all(sample_dem(grid, west, south, v[0], v[1]) <= SEA_M for v in verts):
+                return False
+        return True
+
+    log("procurando a borda da malha")
+    decisions = []
+    locked_points = set()
+    locked_edges = set()
+    for _line, batch in read_batches(src):
+        if batch is None:
+            continue
+        for index in range(0, len(batch) - 2, 3):
+            verificar_cancelamento()
+            verts = batch[index : index + 3]
+            choice = decide(verts)
+            if choice is None:
+                continue
+            decisions.append(choice)
+            if not choice:
+                for n in range(3):
+                    locked_points.add(vertex_key(verts[n]))
+                    locked_edges.add(edge_key(verts[n], verts[(n + 1) % 3]))
+
+    def z_for(vertex, verts):
+        weights = barycentric(vertex, verts[0], verts[1], verts[2])
+        tiny = 1e-7
+        zero = [n for n in range(3) if abs(weights[n]) <= tiny]
+        if len(zero) >= 2:
+            corner = next(n for n in range(3) if n not in zero)
+            if vertex_key(verts[corner]) in locked_points:
+                return vertex[2]
+        elif len(zero) == 1:
+            a, b = [n for n in range(3) if n != zero[0]]
+            if edge_key(verts[a], verts[b]) in locked_edges:
+                return vertex[2]
+        if vertex_key(vertex) in locked_points:
+            return vertex[2]
+        dem_z = sample_dem(grid, west, south, vertex[0], vertex[1])
+        z_value = height_on_mesh(vertex[0], vertex[1], layers, m_lon, dem_z, proteger_agua, blend_m)
+        return vertex[2] if z_value is None else z_value
+
+    nucleos = os.cpu_count() or 2
+    if _fila_log is not None:
+        workers = max(2, nucleos // 2)
+    else:
+        workers = max(2, nucleos - 1)
+    log("cortando os triangulos em %d nucleos" % workers)
+
+    def cortar_um(verts):
+        verificar_cancelamento()
+        return [tuple((v[0], v[1], z_for(v, verts), *v[3:]) for v in piece) for piece in cut_triangle(verts, clips, region, melhorar)]
+
+    kept = 0
+    cut = 0
+    turn = 0
+    before = 0
+    after = 0
+    pending_begin = None
+    patch_cut = []
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        def write_block(begin, pieces):
+            for start in range(0, len(pieces), 2000):
+                fout.write(begin)
+                for piece in pieces[start : start + 2000]:
+                    for vertex in piece:
+                        fout.write(format_vertex(vertex, vertex[2]))
+                fout.write("END_PRIMITIVE\n")
+
+        with open(dst, "w", encoding="utf-8", newline="\n") as fout:
+            for line, batch in read_batches(src):
+                if batch is None:
+                    if line.startswith("BEGIN_PRIMITIVE"):
+                        pending_begin = line
+                        continue
+                    if line.startswith("END_PATCH") and patch_cut:
+                        before += len(patch_cut)
+                        merged = merge_flat(patch_cut)
+                        after += len(merged)
+                        write_block(patch_begin, merged)
+                        patch_cut = []
+                    fout.write(line)
+                    continue
+                begin = pending_begin or "BEGIN_PRIMITIVE 0\n"
+                direct = []
+                made = []
+                futuros = []
+                for index in range(0, len(batch) - 2, 3):
+                    verificar_cancelamento()
                     verts = batch[index : index + 3]
                     lons = [v[0] for v in verts]
                     lats = [v[1] for v in verts]
-                    near = (
-                        max(lons) >= minx - pad
-                        and min(lons) <= maxx + pad
-                        and max(lats) >= miny - pad
-                        and min(lats) <= maxy + pad
+                    near = not (
+                        max(lons) < minx - pad
+                        or min(lons) > maxx + pad
+                        or max(lats) < miny - pad
+                        or min(lats) > maxy + pad
                     )
-                    pieces = cut_triangle(verts, clips, region) if near else [verts]
-                    if pieces == [verts]:
-                        for vertex in verts:
-                            fout.write(format_vertex(vertex, vertex[2]))
+                    do_cut = False
+                    if near:
+                        do_cut = decisions[turn]
+                        turn += 1
+                    if not do_cut:
+                        direct.append(tuple(verts))
                         kept += 1
-                    else:
-                        for piece in pieces:
-                            for vertex in piece:
-                                dem_z = sample_dem(grid, west, south, vertex[0], vertex[1])
-                                z_value = height_on_mesh(vertex[0], vertex[1], layers, m_lon, dem_z)
-                                fout.write(format_vertex(vertex, z_value))
-                        cut += 1
-                    index += 3
-                fout.write(line)
-                continue
-            if primitive and line.startswith("PATCH_VERTEX"):
-                nums = tuple(float(item) for item in line.split()[1:])
-                batch.append(nums)
-                continue
-            fout.write(line)
+                        continue
+                    futuros.append(pool.submit(cortar_um, tuple(verts)))
+                    cut += 1
+                    if cut % 2000 == 0:
+                        log("cortando... %d" % cut)
+                for futuro in futuros:
+                    made.extend(futuro.result())
+                if otimizar and begin.split()[1:2] == ["0"]:
+                    patch_begin = begin
+                    patch_cut.extend(made)
+                    made = []
+                if direct or made:
+                    fout.write(begin)
+                    for piece in direct + made:
+                        for vertex in piece:
+                            fout.write(format_vertex(vertex, vertex[2]))
+                    fout.write(line)
+    finally:
+        pool.shutdown(wait=True)
     log("triangulos cortados %d, mantidos %d" % (cut, kept))
+    if otimizar:
+        log("otimizacao: %d pedacos viraram %d" % (before, after))
     return cut
 
 
-def recortar_dsf(path, layers, log):
-    """Corta a malha do DSF original e grava por cima, sem trocar o backup."""
+def cortar_em_texto(path, work, layers, log, proteger_agua=True, blend_m=BLEND_M, otimizar=False, melhorar=False):
+    """Extrai o DSF original em texto e grava o corte em work/cut.txt."""
     backup = path + ".antes_osm"
     source = backup if os.path.isfile(backup) else path
+    inicio = time.time()
+    raw, _compressed = load_dsf(source, work)
+    log("7z aberto em %.0f s" % (time.time() - inicio))
+    txt = os.path.join(work, "tile.txt")
+    inicio = time.time()
+    run_quiet([dsf_tool(), "--dsf2text", raw, txt])
+    log("malha em texto em %.0f s" % (time.time() - inicio))
+    elev = txt + ".elevation.raw"
+    if not os.path.isfile(elev):
+        raise RuntimeError("o tile nao tem grade de altitude: " + os.path.basename(path))
+    count = os.path.getsize(elev) // 2
+    side = int(round(count ** 0.5))
+    grid = numpy.fromfile(elev, dtype="<i2", count=side * side).reshape(side, side)
+    data = open(raw, "rb").read()
+    props = read_props(data)
+    lat, lon = tile_of(path)
+    west = float(props.get("sim/west", lon))
+    south = float(props.get("sim/south", lat))
+    out_txt = os.path.join(work, "cut.txt")
+    inicio = time.time()
+    cut_mesh_text(txt, out_txt, layers, grid, west, south, log, proteger_agua, blend_m, otimizar, melhorar)
+    log("corte em %.0f s" % (time.time() - inicio))
+    return out_txt
+
+
+def recortar_dsf(path, layers, log, proteger_agua=True, blend_m=BLEND_M, otimizar=False, melhorar=False):
+    """Corta a malha do DSF original e grava por cima, sem trocar o backup."""
     work = tempfile.mkdtemp(prefix="malha_")
     try:
-        raw, _compressed = load_dsf(source, work)
-        txt = os.path.join(work, "tile.txt")
-        subprocess.check_call([dsf_tool(), "--dsf2text", raw, txt], stdout=subprocess.DEVNULL)
-        elev = txt + ".elevation.raw"
-        count = os.path.getsize(elev) // 2
-        side = int(round(count ** 0.5))
-        grid = numpy.fromfile(elev, dtype="<i2", count=side * side).reshape(side, side)
-        data = open(raw, "rb").read()
-        props = read_props(data)
-        lat, lon = tile_of(path)
-        west = float(props.get("sim/west", lon))
-        south = float(props.get("sim/south", lat))
-        out_txt = os.path.join(work, "cut.txt")
-        cut_mesh_text(txt, out_txt, layers, grid, west, south, log)
+        out_txt = cortar_em_texto(path, work, layers, log, proteger_agua, blend_m, otimizar, melhorar)
         out_dsf = os.path.join(work, os.path.basename(path))
-        subprocess.check_call([dsf_tool(), "--text2dsf", out_txt, out_dsf], stdout=subprocess.DEVNULL)
+        inicio = time.time()
+        run_quiet([dsf_tool(), "--text2dsf", out_txt, out_dsf])
+        log("texto para dsf em %.0f s" % (time.time() - inicio))
+        inicio = time.time()
         store_dsf(out_dsf, path, True)
-        log("malha gravada em " + os.path.basename(path))
+        log("7z gravado em %.0f s" % (time.time() - inicio))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -641,47 +883,227 @@ PASTA_PADRAO = r"D:\SteamLibrary\steamapps\common\X-Plane 12\XPlane Map Enhancem
 
 
 def ler_config():
+    base = {"pasta": PASTA_PADRAO, "faixa": 70, "otimizar": False, "melhorar": False}
     if not os.path.isfile(CONFIG_PATH):
-        return {"pasta": PASTA_PADRAO}
+        return base
     try:
         with open(CONFIG_PATH, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
-        return {"pasta": PASTA_PADRAO}
+        return base
     if not data.get("pasta"):
         data["pasta"] = PASTA_PADRAO
+    if not data.get("faixa"):
+        data["faixa"] = 70
     return data
 
 
-def gravar_config(pasta):
+def gravar_config(pasta, faixa, otimizar=False, melhorar=False):
     with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-        json.dump({"pasta": pasta}, handle, ensure_ascii=False, indent=2)
+        json.dump(
+            {"pasta": pasta, "faixa": faixa, "otimizar": bool(otimizar), "melhorar": bool(melhorar)},
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def ler_faixa(texto):
+    try:
+        valor = float(str(texto).replace(",", "."))
+    except ValueError:
+        raise RuntimeError("A faixa precisa ser um número em metros.")
+    if valor < 0 or valor > 500:
+        raise RuntimeError("A faixa fica entre 0 e 500 m.")
+    return valor
 
 
 def dsfs_do_osm(folder, osm):
-    flats, ramps, _bounds = load_patch(osm)
+    patch = load_patch(osm)
+    return [path for path in xpme_dsfs(folder) if cobre_tile(patch, path)]
+
+
+def xpme_dsfs(folder):
     dsfs = find_dsfs(folder)
     south = [path for path in dsfs if "XPME_South_America" in path]
-    if south:
-        dsfs = south
-    hit = []
+    return south or dsfs
+
+
+def osm_do_projeto():
+    os.makedirs(OSM_DIR, exist_ok=True)
+    return sorted(
+        os.path.join(OSM_DIR, name) for name in os.listdir(OSM_DIR) if name.lower().endswith(".osm")
+    )
+
+
+def cobre_tile(patch, path):
+    flats, ramps, _bounds = patch
+    lat, lon = tile_of(path)
+    tile = box(lon, lat, lon + 1, lat + 1)
+    return any(poly.intersects(tile) for poly, _alt in flats) or any(
+        poly.intersects(tile) for poly, *_rest in ramps
+    )
+
+
+def plano_por_tile(folder, origens, log):
+    """Cada tile recebe todos os OSM do projeto que caem nele, porque o corte parte do backup e apagaria os outros."""
+    dsfs = xpme_dsfs(folder)
+    if not dsfs:
+        raise RuntimeError("nenhum DSF nessa pasta")
+    patches = {}
+    for osm in dict.fromkeys(list(origens) + osm_do_projeto()):
+        try:
+            patches[osm] = load_patch(osm)
+        except (ValueError, ET.ParseError) as exc:
+            if osm in origens:
+                raise
+            log("ignorado %s: %s" % (os.path.basename(osm), exc))
+    plano = []
     for path in dsfs:
-        lat, lon = tile_of(path)
-        tile = box(lon, lat, lon + 1, lat + 1)
-        covers = any(poly.intersects(tile) for poly, _alt in flats) or any(
-            poly.intersects(tile) for poly, *_rest in ramps
+        escolhidos = [osm for osm in origens if cobre_tile(patches[osm], path)]
+        if not escolhidos:
+            continue
+        juntos = sorted(
+            (osm for osm in patches if cobre_tile(patches[osm], path)),
+            key=lambda osm: os.path.basename(osm).lower(),
         )
-        if covers:
-            hit.append(path)
-    return hit
+        extras = [osm for osm in juntos if osm not in origens]
+        if extras:
+            log("%s: incluindo tambem %s, que cai no mesmo tile" % (
+                os.path.basename(path), ", ".join(os.path.basename(osm) for osm in extras)))
+        plano.append((path, juntos))
+    if not plano:
+        raise RuntimeError("nenhum DSF cobre a area dos OSM marcados")
+    return plano
 
 
-def recuperar(folder, osm, log):
-    paths = dsfs_do_osm(folder, osm)
-    if not paths:
-        raise RuntimeError("nenhum DSF cobre a area desse OSM")
+_fila_log = None
+
+
+def _iniciar_processo(evento, fila):
+    global cancelar, _fila_log
+    cancelar = evento
+    _fila_log = fila
+
+
+def compilar_tile(path, osms, opcoes, log=None):
+    """Corta um tile com todos os OSM dele. Roda num processo separado ou no próprio processo."""
+    nome = os.path.basename(path)
+
+    def escrever(texto):
+        linha = "%s  %s" % (nome, texto)
+        if log is not None:
+            log(linha)
+        elif _fila_log is not None:
+            _fila_log.put(linha)
+
+    try:
+        layers = []
+        for osm in osms:
+            flats, ramps, _bounds = load_patch(osm)
+            layers += layers_of(flats, ramps)
+        escrever("%d OSM, %d poligonos, faixa %.0f m" % (len(osms), len(layers), opcoes["faixa"]))
+        backup = path + ".antes_osm"
+        if not os.path.isfile(backup):
+            shutil.copy2(path, backup)
+            escrever("backup criado")
+        inicio = time.time()
+        recortar_dsf(path, layers, escrever, True, opcoes["faixa"], opcoes["otimizar"], opcoes["melhorar"])
+        escrever("pronto em %.0f s" % (time.time() - inicio))
+        return "ok"
+    except Cancelado:
+        return "cancelado"
+    except Exception as exc:
+        raise RuntimeError("%s: %s" % (nome, exc)) from None
+
+
+def compilar_varios(folder, origens, log, opcoes, progresso=None, paralelo=True):
+    """Compila os OSM marcados agrupados por tile. Tiles diferentes rodam ao mesmo tempo."""
+    global _evento_processos
+    plano = plano_por_tile(folder, origens, log)
+    total = len(plano)
+    if progresso:
+        progresso(0, total)
+    if not paralelo or total == 1:
+        for feito, (path, osms) in enumerate(plano, start=1):
+            if compilar_tile(path, osms, opcoes, log) == "cancelado" or cancelar.is_set():
+                raise Cancelado()
+            if progresso:
+                progresso(feito, total)
+        return total
+    contexto = multiprocessing.get_context("spawn")
+    evento = contexto.Event()
+    fila = contexto.Queue()
+    _evento_processos = evento
+    if cancelar.is_set():
+        evento.set()
+    nucleos = os.cpu_count() or 2
+    processos = max(1, min(total, nucleos - 1))
+    log("%d tiles, %d ao mesmo tempo" % (total, processos))
+
+    def esvaziar():
+        while True:
+            try:
+                log(fila.get_nowait())
+            except Exception:
+                return
+
+    feito = 0
+    erro = None
+    try:
+        with ProcessPoolExecutor(
+            max_workers=processos,
+            mp_context=contexto,
+            initializer=_iniciar_processo,
+            initargs=(evento, fila),
+        ) as pool:
+            pendentes = {pool.submit(compilar_tile, path, osms, opcoes) for path, osms in plano}
+            while pendentes:
+                prontos, pendentes = wait(pendentes, timeout=0.3, return_when=FIRST_COMPLETED)
+                esvaziar()
+                if cancelar.is_set():
+                    evento.set()
+                for futuro in prontos:
+                    try:
+                        resultado = futuro.result()
+                    except Exception as exc:
+                        erro = erro or exc
+                        evento.set()
+                        continue
+                    if resultado == "ok":
+                        feito += 1
+                        if progresso:
+                            progresso(feito, total)
+            esvaziar()
+    finally:
+        _evento_processos = None
+    if erro is not None:
+        raise erro
+    if cancelar.is_set():
+        raise Cancelado()
+    return total
+
+
+def aplicar(folder, osm, log, proteger_agua=True, blend_m=70.0, otimizar=False, melhorar=False):
+    opcoes = {"faixa": blend_m, "otimizar": otimizar, "melhorar": melhorar}
+    return compilar_varios(folder, [osm], log, opcoes, paralelo=False)
+
+
+def recuperar_varios(folder, origens, log, progresso=None):
+    """Restaura cada tile uma vez, mesmo quando vários OSM caem nele."""
+    visto = []
+    for osm in origens:
+        for path in dsfs_do_osm(folder, osm):
+            if path not in visto:
+                visto.append(path)
+    if not visto:
+        raise RuntimeError("nenhum DSF cobre a area desses OSM")
     restored = 0
-    for path in paths:
+    total = len(visto)
+    if progresso:
+        progresso(0, total)
+    for path in visto:
+        verificar_cancelamento()
         backup = path + ".antes_osm"
         if not os.path.isfile(backup):
             log("sem backup: " + path)
@@ -689,9 +1111,15 @@ def recuperar(folder, osm, log):
         shutil.copy2(backup, path)
         log("recuperado " + os.path.basename(path))
         restored += 1
+        if progresso:
+            progresso(restored, total)
     if not restored:
-        raise RuntimeError("os tiles desse OSM ainda nao tem backup")
+        raise RuntimeError("os tiles desses OSM ainda nao tem backup")
     return restored
+
+
+def recuperar(folder, osm, log, proteger_agua=True):
+    return recuperar_varios(folder, [osm], log)
 
 
 def porta_aberta(port):
@@ -715,28 +1143,269 @@ def abrir_editor(osm_path):
             ensure_ascii=False,
             indent=2,
         )
-    if not porta_aberta(8767):
-        subprocess.Popen(
-            ["py", "-3.12", os.path.join(EDITOR_DIR, "servir-editor.py")],
-            cwd=EDITOR_DIR,
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-        )
-    webbrowser.open("http://127.0.0.1:8767/editor.html")
+    spec = importlib.util.spec_from_file_location("servir_editor", os.path.join(EDITOR_DIR, "servir-editor.py"))
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    url = modulo.garantir_servidor()
+    try:
+        import webview
+    except ImportError as exc:
+        raise RuntimeError("Falta o pywebview. Rode: py -3.12 -m pip install pywebview") from exc
+    webview.create_window("OsmTerreno — editor", url, width=1280, height=860)
+    webview.start()
+
+
+def triangulos_do_texto(txt, bbox):
+    """Triângulos que tocam a caixa (oeste, sul, leste, norte), sem repetir as camadas."""
+    west, south, east, north = bbox
+    seen = set()
+    tris = []
+    for _line, batch in read_batches(txt):
+        if batch is None:
+            continue
+        for index in range(0, len(batch) - 2, 3):
+            verts = batch[index : index + 3]
+            if not any(west <= v[0] <= east and south <= v[1] <= north for v in verts):
+                continue
+            key = tuple(sorted(vertex_key(v) for v in verts))
+            if key in seen:
+                continue
+            seen.add(key)
+            tris.append(tuple((v[0], v[1], v[2]) for v in verts))
+    return tris
+
+
+def malha_da_area(path, bbox):
+    work = tempfile.mkdtemp(prefix="visor_")
+    try:
+        raw, _compressed = load_dsf(path, work)
+        txt = os.path.join(work, "tile.txt")
+        run_quiet([dsf_tool(), "--dsf2text", raw, txt])
+        return triangulos_do_texto(txt, bbox)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def previa_da_area(path, layers, bbox, blend_m, otimizar, log, melhorar=False):
+    """Corta o original em memória, sem gravar o DSF, e devolve os triângulos da área."""
+    work = tempfile.mkdtemp(prefix="previa_")
+    try:
+        out_txt = cortar_em_texto(path, work, layers, log, True, blend_m, otimizar, melhorar)
+        return triangulos_do_texto(out_txt, bbox)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cor_altura(z, low, high):
+    if z <= SEA_M:
+        return "#1d4f8c"
+    t = 0.0 if high <= low else min(max((z - low) / (high - low), 0.0), 1.0)
+    stops = ((0.0, (60, 140, 70)), (0.5, (200, 190, 90)), (1.0, (190, 90, 50)))
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t <= t1:
+            k = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+            rgb = [int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)]
+            return "#%02x%02x%02x" % tuple(rgb)
+    return "#be5a32"
+
+
+class VisorMalha(tk.Toplevel):
+    def __init__(self, master, folder, osm, blend_m=BLEND_M, melhorar=False):
+        super().__init__(master)
+        self.blend_m = blend_m
+        self.melhorar = melhorar
+        self.title("Malha — " + os.path.basename(osm))
+        self.geometry("1000x760")
+        self.folder = folder
+        self.osm = osm
+        self.fonte = tk.StringVar(value="atual")
+        self.info = tk.StringVar(value="Lendo o DSF…")
+        self.itens = {}
+        topo = ttk.Frame(self)
+        topo.pack(fill="x", padx=8, pady=6)
+        ttk.Radiobutton(topo, text="Compilado", variable=self.fonte, value="atual", command=self.carregar).pack(side="left")
+        ttk.Radiobutton(topo, text="Original (.antes_osm)", variable=self.fonte, value="original", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(topo, text="Prévia normal", variable=self.fonte, value="previa", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(topo, text="Prévia otimizada", variable=self.fonte, value="otimizada", command=self.carregar).pack(side="left", padx=(8, 0))
+        ttk.Label(topo, textvariable=self.info).pack(side="left", padx=12)
+        self.canvas = tk.Canvas(self, background="#111111", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        rodape = ttk.Frame(self)
+        rodape.pack(fill="x", padx=8, pady=4)
+        self.posicao = tk.StringVar(value="")
+        ttk.Label(rodape, textvariable=self.posicao, font=("Consolas", 10)).pack(side="left")
+        ttk.Label(
+            rodape,
+            text="Roda: zoom   Arrastar: mover   Botão direito: copiar coordenada",
+        ).pack(side="right")
+        self.transf = None
+        self.canvas.bind("<MouseWheel>", self.zoom)
+        self.canvas.bind("<ButtonPress-3>", self.copiar_coordenada)
+        self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
+        self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+        self.canvas.bind("<Motion>", self.mostrar_altura)
+        self.flats, self.ramps, bounds = load_patch(osm)
+        pad = 250.0 / 111320.0
+        self.bbox = (bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)
+        self.carregar()
+
+    def carregar(self):
+        paths = dsfs_do_osm(self.folder, self.osm)
+        if not paths:
+            self.info.set("Nenhum DSF cobre esse OSM.")
+            return
+        fonte = self.fonte.get()
+        self.pedido = getattr(self, "pedido", 0) + 1
+        pedido = self.pedido
+        escolhidos = []
+        for path in paths:
+            backup = path + ".antes_osm"
+            if fonte == "original":
+                if os.path.isfile(backup):
+                    escolhidos.append(backup)
+            else:
+                escolhidos.append(path)
+        if not escolhidos:
+            self.info.set("Esse tile ainda não tem backup .antes_osm.")
+            return
+        self.canvas.delete("all")
+        previa = fonte in ("previa", "otimizada")
+        self.info.set("Cortando em memória, leva alguns minutos…" if previa else "Lendo o DSF…")
+        bbox = self.bbox
+        layers = layers_of(self.flats, self.ramps)
+        blend_m = self.blend_m
+        melhorar = self.melhorar
+
+        def aviso(texto):
+            self.after(0, lambda: pedido == self.pedido and self.info.set("Prévia: " + texto))
+
+        def trabalho():
+            try:
+                tris = []
+                for path in escolhidos:
+                    if previa:
+                        tris.extend(previa_da_area(path, layers, bbox, blend_m, fonte == "otimizada", aviso, melhorar))
+                    else:
+                        tris.extend(malha_da_area(path, bbox))
+            except Exception as exc:
+                self.after(0, lambda exc=exc: pedido == self.pedido and self.info.set("Erro: " + str(exc)))
+                return
+            self.after(0, lambda: pedido == self.pedido and self.desenhar(tris))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def desenhar(self, tris):
+        if not self.winfo_exists():
+            return
+        self.canvas.delete("all")
+        self.itens = {}
+        west, south, east, north = self.bbox
+        m_lon = 111320.0 * cos(radians((south + north) * 0.5))
+        largura = max(self.canvas.winfo_width(), 400)
+        altura = max(self.canvas.winfo_height(), 300)
+        escala = min(largura / ((east - west) * m_lon), altura / ((north - south) * 111320.0))
+
+        def xy(lon, lat):
+            return ((lon - west) * m_lon * escala, (north - lat) * 111320.0 * escala)
+
+        self.transf = {"west": west, "north": north, "sx": m_lon * escala, "sy": 111320.0 * escala, "k": 1.0, "ox": 0.0, "oy": 0.0}
+
+        zs = [v[2] for tri in tris for v in tri if v[2] > SEA_M]
+        low = min(zs) if zs else 0.0
+        high = max(zs) if zs else 1.0
+        for tri in tris:
+            z = sum(v[2] for v in tri) / 3.0
+            coords = [c for v in tri for c in xy(v[0], v[1])]
+            item = self.canvas.create_polygon(coords, fill=cor_altura(z, low, high), outline="#000000", width=1)
+            self.itens[item] = tri
+        for polygon, _alt in self.flats:
+            coords = [c for lon, lat in polygon.exterior.coords for c in xy(lon, lat)]
+            self.canvas.create_line(coords, fill="#ff3b3b", width=2)
+        for polygon, *_rest in self.ramps:
+            coords = [c for lon, lat in polygon.exterior.coords for c in xy(lon, lat)]
+            self.canvas.create_line(coords, fill="#ff9f1a", width=2)
+        nome = {
+            "atual": "compilado",
+            "original": "original",
+            "previa": "prévia normal",
+            "otimizada": "prévia otimizada",
+        }[self.fonte.get()]
+        self.info.set("%s: %d triângulos na área   altura %.1f a %.1f m" % (nome, len(tris), low, high))
+
+    def zoom(self, event):
+        fator = 1.25 if event.delta > 0 else 0.8
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        pendente = getattr(self, "_zoom", None)
+        if pendente:
+            self.after_cancel(pendente[0])
+            fator *= pendente[1]
+        self._zoom = (self.after(120, lambda: self._aplicar_zoom(x, y)), fator)
+
+    def _aplicar_zoom(self, x, y):
+        fator = self._zoom[1]
+        self._zoom = None
+        self.canvas.scale("all", x, y, fator, fator)
+        if self.transf:
+            t = self.transf
+            t["k"] *= fator
+            t["ox"] = x + (t["ox"] - x) * fator
+            t["oy"] = y + (t["oy"] - y) * fator
+
+    def coordenada(self, event):
+        if not self.transf:
+            return None
+        t = self.transf
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        bx = (cx - t["ox"]) / t["k"]
+        by = (cy - t["oy"]) / t["k"]
+        return (t["north"] - by / t["sy"], t["west"] + bx / t["sx"])
+
+    def mostrar_altura(self, event):
+        ponto = self.coordenada(event)
+        if ponto is None:
+            return
+        texto = "lat %.7f   lon %.7f" % ponto
+        atual = self.canvas.find_withtag("current")
+        if atual and atual[0] in self.itens:
+            tri = self.itens[atual[0]]
+            texto += "   vértices: %s m" % ", ".join("%.2f" % v[2] for v in tri)
+        self.posicao.set(texto)
+
+    def copiar_coordenada(self, event):
+        ponto = self.coordenada(event)
+        if ponto is None:
+            return
+        texto = "%.7f, %.7f" % ponto
+        self.clipboard_clear()
+        self.clipboard_append(texto)
+        self.posicao.set("copiado: " + texto)
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("OsmTerreno")
-        self.geometry("760x520")
-        self.folder = tk.StringVar(value=ler_config()["pasta"])
+        self.geometry("860x580")
+        self.minsize(720, 480)
+        cfg = ler_config()
+        self.folder = tk.StringVar(value=cfg["pasta"])
+        self.faixa = tk.StringVar(value=str(cfg.get("faixa", 70)))
+        self.otimizar = tk.BooleanVar(value=bool(cfg.get("otimizar", False)))
+        self.melhorar = tk.BooleanVar(value=bool(cfg.get("melhorar", False)))
+        self.status = tk.StringVar(value="Pronto")
         self.busy = False
-        pad = {"padx": 8, "pady": 4}
+        self.fechando = False
+        self.botoes = []
+        self.protocol("WM_DELETE_WINDOW", self.ao_fechar)
+        pad = {"padx": 10, "pady": 4}
         frm = ttk.Frame(self)
         frm.pack(fill="x", **pad)
         ttk.Label(frm, text="Pasta dos terrenos").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.folder, width=78).grid(row=1, column=0, sticky="we")
-        ttk.Button(frm, text="Pasta...", command=self.pick_folder).grid(row=1, column=1, padx=6)
+        self.entrada_pasta = ttk.Entry(frm, textvariable=self.folder, width=78)
+        self.entrada_pasta.grid(row=1, column=0, sticky="we")
+        self._botao(frm, "Pasta...", self.pick_folder).grid(row=1, column=1, padx=6)
         frm.columnconfigure(0, weight=1)
 
         body = ttk.Frame(self)
@@ -760,27 +1429,81 @@ class App(tk.Tk):
         barra.pack(side="right", fill="y")
         botoes = ttk.Frame(left)
         botoes.pack(fill="x", pady=6)
-        ttk.Button(botoes, text="Importar", command=self.importar).pack(side="left", padx=(0, 4))
-        ttk.Button(botoes, text="Exportar", command=self.exportar).pack(side="left", padx=4)
-        ttk.Button(botoes, text="Apagar", command=self.apagar).pack(side="left", padx=4)
-        ttk.Button(botoes, text="Editar", command=self.editar).pack(side="left", padx=4)
-        ttk.Button(botoes, text="Selecionar tudo", command=self.marcar_todos).pack(side="left", padx=4)
-        ttk.Button(botoes, text="Desmarcar tudo", command=self.desmarcar_todos).pack(side="left", padx=4)
+        for texto, comando in (
+            ("Importar", self.importar),
+            ("Exportar", self.exportar),
+            ("Apagar", self.apagar),
+            ("Editar", self.editar),
+            ("Ver malha", self.ver_malha),
+            ("Selecionar tudo", self.marcar_todos),
+            ("Desmarcar tudo", self.desmarcar_todos),
+        ):
+            self._botao(botoes, texto, comando).pack(side="left", padx=(0, 4))
 
-        acoes = ttk.Frame(body)
+        acoes = ttk.LabelFrame(body, text="Ações")
         acoes.pack(side="left", fill="y", padx=(10, 0))
-        ttk.Button(acoes, text="Compilar", command=self.compilar).pack(fill="x", pady=4)
-        ttk.Button(acoes, text="Recuperar", command=self.recuperar_click).pack(fill="x", pady=4)
+        ttk.Label(acoes, text="Faixa ao redor (m)").pack(anchor="w", padx=8, pady=(8, 0))
+        self.entrada_faixa = ttk.Entry(acoes, textvariable=self.faixa, width=8)
+        self.entrada_faixa.pack(anchor="w", padx=8, pady=(2, 6))
+        self.caixa_otimizar = ttk.Checkbutton(acoes, text="Otimizar malha (teste)", variable=self.otimizar)
+        self.caixa_otimizar.pack(anchor="w", padx=8, pady=(0, 6))
+        self.caixa_melhorar = ttk.Checkbutton(acoes, text="Melhorar triângulos", variable=self.melhorar)
+        self.caixa_melhorar.pack(anchor="w", padx=8, pady=(0, 6))
+        self._botao(acoes, "Compilar", self.compilar).pack(fill="x", padx=8, pady=(8, 4))
+        self._botao(acoes, "Recuperar", self.recuperar_click).pack(fill="x", padx=8, pady=4)
 
         self.log = tk.Text(self, height=12, wrap="word")
-        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.log.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        rodape = ttk.Frame(self)
+        rodape.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(rodape, textvariable=self.status).pack(anchor="w")
+        self.progresso = ttk.Progressbar(rodape, mode="determinate", maximum=1)
+        self.progresso.pack(fill="x", pady=(4, 0))
         self.recarregar()
+
+    def _botao(self, pai, texto, comando):
+        botao = ttk.Button(pai, text=texto, command=comando)
+        self.botoes.append(botao)
+        return botao
+
+    def ao_fechar(self):
+        if self.busy:
+            if not messagebox.askyesno(
+                "OsmTerreno",
+                "A compilação está em andamento.\nCancelar tudo e fechar?",
+            ):
+                return
+            self.fechando = True
+            pedir_cancelamento()
+            self.destroy()
+            return
+        if messagebox.askokcancel("OsmTerreno", "Fechar o OsmTerreno?"):
+            self.fechando = True
+            self.destroy()
+
+    def _travar(self, travado):
+        estado = "disabled" if travado else "normal"
+        for botao in self.botoes:
+            botao.configure(state=estado)
+        self.entrada_pasta.configure(state=estado)
+        self.entrada_faixa.configure(state=estado)
+        self.caixa_otimizar.configure(state=estado)
+        self.caixa_melhorar.configure(state=estado)
+        for filho in self.lista_frame.winfo_children():
+            try:
+                filho.configure(state=estado)
+            except tk.TclError:
+                pass
 
     def pick_folder(self):
         path = filedialog.askdirectory(initialdir=self.folder.get() or "D:\\")
         if path:
             self.folder.set(path)
-            gravar_config(path)
+            try:
+                faixa = ler_faixa(self.faixa.get())
+            except RuntimeError:
+                faixa = 70
+            gravar_config(path, faixa, self.otimizar.get(), self.melhorar.get())
 
     def selecionados(self):
         escolhidos = [nome for nome, var in self.marcas.items() if var.get()]
@@ -871,6 +1594,26 @@ class App(tk.Tk):
             return
         self.write("editor aberto em " + os.path.basename(origens[0]))
 
+    def ver_malha(self):
+        origens = self.selecionados()
+        if not origens:
+            return
+        if len(origens) > 1:
+            messagebox.showinfo("OsmTerreno", "Ver malha abre um OSM. Deixe só um selecionado.")
+            return
+        folder = self.folder.get().strip()
+        if not os.path.isdir(folder):
+            messagebox.showerror("OsmTerreno", "A pasta dos terrenos nao existe.")
+            return
+        try:
+            blend_m = ler_faixa(self.faixa.get())
+        except RuntimeError:
+            blend_m = BLEND_M
+        try:
+            VisorMalha(self, folder, origens[0], blend_m, self.melhorar.get())
+        except Exception as exc:
+            messagebox.showerror("OsmTerreno", str(exc))
+
     def write(self, line):
         self.after(0, lambda line=line: self._escrever(line))
 
@@ -888,27 +1631,65 @@ class App(tk.Tk):
         if not os.path.isdir(folder):
             messagebox.showerror("OsmTerreno", "A pasta dos terrenos nao existe.")
             return
-        gravar_config(folder)
+        try:
+            faixa = ler_faixa(self.faixa.get())
+        except RuntimeError as exc:
+            messagebox.showerror("OsmTerreno", str(exc))
+            return
+        otimizar = self.otimizar.get()
+        melhorar = self.melhorar.get()
+        gravar_config(folder, faixa, otimizar, melhorar)
+        cancelar.clear()
+        self.fechando = False
         self.busy = True
+        self._travar(True)
         self.log.delete("1.0", "end")
+        total = len(origens)
+        self._mostrar_progresso(0, total, "Preparando…")
+
+        def andamento(feito, quantos):
+            texto = "Tiles prontos: %d de %d" % (feito, quantos)
+            self.after(0, lambda: self._mostrar_progresso(feito, quantos, texto))
 
         def trabalho():
+            nonlocal total
             try:
-                for origem in origens:
-                    self.write(os.path.basename(origem))
-                    func(folder, origem, self.write)
+                if func is aplicar:
+                    opcoes = {"faixa": faixa, "otimizar": otimizar, "melhorar": melhorar}
+                    total = compilar_varios(folder, origens, self.write, opcoes, andamento)
+                else:
+                    total = recuperar_varios(folder, origens, self.write, andamento)
+            except Cancelado:
+                pass
             except Exception as exc:
-                self.after(0, lambda exc=exc: self.write("erro: " + str(exc)))
-                self.after(0, lambda exc=exc: messagebox.showerror("OsmTerreno", str(exc)))
+                if not self.fechando:
+                    self.after(0, lambda exc=exc: self.write("erro: " + str(exc)))
+                    self.after(0, lambda exc=exc: self.status.set("Falhou: " + str(exc)))
+                    self.after(0, lambda exc=exc: messagebox.showerror("OsmTerreno", str(exc)))
             else:
-                self.after(0, lambda: messagebox.showinfo("OsmTerreno", "Concluido. Reinicie o X-Plane para ver."))
+                if not self.fechando and not cancelar.is_set():
+                    self.after(0, lambda: self._mostrar_progresso(total, total, "Concluído"))
+                    self.after(0, lambda: messagebox.showinfo(
+                        "OsmTerreno",
+                        "Compilação concluída.\nReinicie o X-Plane para ver.",
+                    ))
             finally:
-                self.after(0, self._liberar)
+                if not self.fechando:
+                    self.after(0, self._liberar)
 
         threading.Thread(target=trabalho, daemon=True).start()
 
+    def _mostrar_progresso(self, feito, total, texto):
+        self.status.set(texto)
+        self.title("OsmTerreno — " + texto)
+        self.progresso.stop()
+        self.progresso.configure(mode="determinate", maximum=max(total, 1), value=feito)
+
     def _liberar(self):
         self.busy = False
+        self._travar(False)
+        if self.status.get() == "Concluído":
+            self.title("OsmTerreno — concluído")
 
     def compilar(self):
         self._rodar(aplicar)
@@ -926,5 +1707,34 @@ class App(tk.Tk):
         self._rodar(recuperar)
 
 
+def compilar_todos():
+    """Usado pelo Compilar.bat: todos os OSM da pasta osm, com as opções salvas na janela."""
+    config = ler_config()
+    opcoes = {
+        "faixa": ler_faixa(str(config.get("faixa", BLEND_M))),
+        "otimizar": bool(config.get("otimizar")),
+        "melhorar": bool(config.get("melhorar")),
+    }
+    origens = osm_do_projeto()
+    if not origens:
+        print("nenhum OSM na pasta osm")
+        return 1
+    try:
+        compilar_varios(config["pasta"], origens, print, opcoes,
+                        lambda feito, total: print("tiles prontos: %d de %d" % (feito, total)))
+    except KeyboardInterrupt:
+        pedir_cancelamento()
+        print("cancelado")
+        return 1
+    except Exception as exc:
+        print("erro: %s" % exc)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
+    import sys
+
+    if "--compilar-todos" in sys.argv:
+        sys.exit(compilar_todos())
     App().mainloop()

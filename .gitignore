@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 *.bak
 *.osm.bak
+config.json
+editor/editor-config.json
